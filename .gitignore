@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# 编辑器和系统文件
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 数据集、场景和轨迹，体积大，单独放在集群上
+data/
+
+# 训练、评测和日志产物
+checkpoints/
+results/
+logs/
+wandb/
+runs/
+outputs/
+output/
+video_results/
+*.log
+
+# 模型权重
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
