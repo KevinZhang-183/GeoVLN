@@ -27,22 +27,46 @@ DEFAULT_RESULT = "/root/data1/StreamVLN/results/r2r_val_unseen_v1_3/result.json"
 
 
 def load_episodes(path: Path) -> tuple[list[dict], int]:
-    text = path.read_text(encoding="utf-8").strip()
-    if not text:
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
         raise SystemExit(f"结果文件是空的: {path}")
 
-    if text.startswith("["):
+    decoder = json.JSONDecoder()
+    if text.lstrip().startswith("["):
         records = json.loads(text)
     else:
         records = []
-        for line_no, line in enumerate(text.splitlines(), start=1):
-            line = line.strip().rstrip(",")
+        bad_lines: list[tuple[int, str]] = []
+        for line_no, raw in enumerate(text.splitlines(), start=1):
+            line = raw.strip().rstrip(",")
             if not line:
                 continue
             try:
                 records.append(json.loads(line))
-            except json.JSONDecodeError as exc:
-                raise SystemExit(f"{path}:{line_no} 不是合法 JSON: {exc}") from exc
+                continue
+            except json.JSONDecodeError:
+                pass
+            idx = 0
+            salvaged = 0
+            while idx < len(line):
+                while idx < len(line) and line[idx].isspace():
+                    idx += 1
+                if idx >= len(line):
+                    break
+                try:
+                    obj, end = decoder.raw_decode(line, idx)
+                except json.JSONDecodeError:
+                    break
+                records.append(obj)
+                salvaged += 1
+                idx = end
+            if salvaged == 0:
+                bad_lines.append((line_no, raw[:160]))
+        if bad_lines:
+            for line_no, sample in bad_lines[:5]:
+                print(f"warning: 跳过第 {line_no} 行，内容不是 JSON: {sample!r}")
+            if len(bad_lines) > 5:
+                raise SystemExit(f"有 {len(bad_lines)} 行无法解析，超过文件末尾的汇总残留，停止抽样")
 
     episodes: list[dict] = []
     skipped = 0
