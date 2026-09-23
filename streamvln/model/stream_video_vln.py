@@ -10,6 +10,7 @@ from transformers import Qwen2ForCausalLM
 from llava.model.language_model.llava_qwen import LlavaQwenModel
 from llava.model.llava_arch import LlavaMetaForCausalLM
 from utils.utils import IGNORE_INDEX, IMAGE_TOKEN_INDEX, MEMORY_TOKEN_INDEX
+from .geo_register_projector import GEO_DIM, REGISTERS_PER_FRAME, append_geo_with_labels
 
 class StreamVLNModel(LlavaQwenModel):
     def __init__(
@@ -143,13 +144,19 @@ class StreamVLNForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
    
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels, 
-        images, image_sizes, depths, poses, intrinsics, time_ids=None, task_ids=None
+        images, image_sizes, depths, poses, intrinsics, time_ids=None, task_ids=None,
+        geo_registers=None, geo_projector=None,
     ):  
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
         image_features, memory_features = self.encode_rgbd(images, depths, poses, intrinsics, time_ids, task_ids)
+        if geo_registers is not None:
+            if geo_registers.ndim != 4 or geo_registers.shape[-2] != REGISTERS_PER_FRAME or geo_registers.shape[-1] != GEO_DIM:
+                raise ValueError(
+                    f"geo_registers must be (B, T, {REGISTERS_PER_FRAME}, {GEO_DIM}), got {tuple(geo_registers.shape)}"
+                )
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
@@ -218,8 +225,17 @@ class StreamVLNForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         cur_image_feature = image_features[batch_idx][cur_img_id]
                         cur_img_id += 1
                         # print(batch_idx, i, 'cur_image_feature shape:', cur_image_feature.shape)
-                        cur_new_input_embeds.append(cur_image_feature)
-                        cur_new_labels.append(torch.full((cur_image_feature.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+                        image_labels = torch.full((cur_image_feature.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype)
+                        if geo_registers is None:
+                            cur_new_input_embeds.append(cur_image_feature)
+                            cur_new_labels.append(image_labels)
+                        else:
+                            frame_registers = geo_registers[batch_idx, cur_img_id - 1]
+                            merged_tokens, merged_labels = append_geo_with_labels(
+                                cur_image_feature, image_labels, frame_registers, geo_projector
+                            )
+                            cur_new_input_embeds.append(merged_tokens)
+                            cur_new_labels.append(merged_labels)
                     elif special_token == MEMORY_TOKEN_INDEX:
                         cur_memory_feature = memory_features[batch_idx][cur_mem_id]
                         cur_mem_id += 1
@@ -228,6 +244,11 @@ class StreamVLNForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         cur_new_labels.append(torch.full((cur_memory_feature.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
                     else:
                         raise NotImplementedError
+
+            if geo_registers is not None and cur_img_id != geo_registers.shape[1]:
+                raise ValueError(
+                    f"image tokens ({cur_img_id}) and register frames ({geo_registers.shape[1]}) differ"
+                )
             
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
@@ -314,6 +335,8 @@ class StreamVLNForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         input_ids_ = input_ids
         time_ids = kwargs.get("time_ids", None)
         task_ids = kwargs.get("task_type", None)
+        geo_registers = kwargs.pop("geo_registers", None)
+        geo_projector = kwargs.pop("geo_projector", None)
         if inputs_embeds is None:
             (
                 input_ids,
@@ -334,7 +357,9 @@ class StreamVLNForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 poses, 
                 intrinsics,
                 time_ids,
-                task_ids
+                task_ids,
+                geo_registers,
+                geo_projector,
             )
     
         return super().forward(
@@ -366,6 +391,8 @@ class StreamVLNForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         attention_mask = kwargs.pop("attention_mask", None)
         time_ids = kwargs.pop("time_ids", None)
         task_ids = kwargs.pop("task_type", None)
+        geo_registers = kwargs.pop("geo_registers", None)
+        geo_projector = kwargs.pop("geo_projector", None)
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
         if images is not None:
@@ -388,7 +415,9 @@ class StreamVLNForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 poses,
                 intrinsics,
                 time_ids,
-                task_ids
+                task_ids,
+                geo_registers,
+                geo_projector,
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
