@@ -50,12 +50,20 @@ class MapConfig:
     free_cap_m: float = 5.0
     agent_radius_m: float = 0.2
     hit_logodds: float = 0.85
-    miss_logodds: float = 0.4
+    miss_logodds: float = 0.55
     clamp_logodds: float = 4.0
     occupied_logodds: float = 0.6
     free_logodds: float = -0.4
+    hole_cells: int = 3
+    wall_gap_cells: int = 3
     assoc_dist_m: float = 0.5
     assoc_angle_deg: float = 35.0
+    close_dist_m: float = 0.45
+    close_angle_deg: float = 70.0
+    merge_dist_m: float = 0.70
+    merge_endpoint_m: float = 0.35
+    merge_overlap_m: float = 0.15
+    partial_max_m: float = 2.0
     width_ratio: float = 1.6
     min_segment_m: float = 0.1
     confirm_hits: int = 2
@@ -101,6 +109,86 @@ def _segments_cross(p1, p2, q1, q2):
     )
 
 
+def _segment_sep(a0, a1, b0, b1):
+    """Minimum distance between two segments. Zero when they cross."""
+    if _segments_cross(a0, a1, b0, b1):
+        return 0.0
+    return min(
+        _point_segment_dist(a0, b0, b1),
+        _point_segment_dist(a1, b0, b1),
+        _point_segment_dist(b0, a0, a1),
+        _point_segment_dist(b1, a0, a1),
+    )
+
+
+def _same_opening(a0, a1, b0, b1, sep_m, end_m, min_overlap):
+    """True when two doorway segments are the same opening, including oblique repeats.
+
+    Nearly parallel segments that sit side by side without overlapping stay apart,
+    so neighboring doors on one wall are not merged.
+    """
+    a0 = np.asarray(a0, dtype=np.float64)
+    a1 = np.asarray(a1, dtype=np.float64)
+    b0 = np.asarray(b0, dtype=np.float64)
+    b1 = np.asarray(b1, dtype=np.float64)
+    if _segments_cross(a0, a1, b0, b1):
+        return True
+    sep = _segment_sep(a0, a1, b0, b1)
+    ends = min(
+        float(np.linalg.norm(a0 - b0)),
+        float(np.linalg.norm(a0 - b1)),
+        float(np.linalg.norm(a1 - b0)),
+        float(np.linalg.norm(a1 - b1)),
+    )
+    if sep > sep_m and ends > end_m:
+        return False
+    da, db = a1 - a0, b1 - b0
+    direction = da if float(np.dot(da, da)) >= float(np.dot(db, db)) else db
+    direction = _unit(direction)
+    pa = sorted((float(np.dot(a0, direction)), float(np.dot(a1, direction))))
+    pb = sorted((float(np.dot(b0, direction)), float(np.dot(b1, direction))))
+    overlap = min(pa[1], pb[1]) - max(pa[0], pb[0])
+    cos = 1.0
+    if float(np.dot(da, da)) > 1e-8 and float(np.dot(db, db)) > 1e-8:
+        cos = abs(float(np.dot(_unit(da), _unit(db))))
+    if overlap < min_overlap and cos > math.cos(math.radians(25)):
+        return False
+    # A corner's two doors can sit within sep_m without covering the same span.
+    if overlap < min_overlap and ends > end_m:
+        return False
+    return True
+
+
+def _dilate(mask, radius=1):
+    cur = np.asarray(mask, dtype=bool)
+    for _ in range(max(1, radius)):
+        nxt = cur.copy()
+        nxt[1:] |= cur[:-1]
+        nxt[:-1] |= cur[1:]
+        nxt[:, 1:] |= cur[:, :-1]
+        nxt[:, :-1] |= cur[:, 1:]
+        nxt[1:, 1:] |= cur[:-1, :-1]
+        nxt[:-1, :-1] |= cur[1:, 1:]
+        nxt[1:, :-1] |= cur[:-1, 1:]
+        nxt[:-1, 1:] |= cur[1:, :-1]
+        cur = nxt
+    return cur
+
+
+def _neighbor_count(mask):
+    m = np.asarray(mask, dtype=np.uint8)
+    count = np.zeros(m.shape, dtype=np.uint8)
+    count[1:] += m[:-1]
+    count[:-1] += m[1:]
+    count[:, 1:] += m[:, :-1]
+    count[:, :-1] += m[:, 1:]
+    count[1:, 1:] += m[:-1, :-1]
+    count[:-1, :-1] += m[1:, 1:]
+    count[1:, :-1] += m[:-1, 1:]
+    count[:-1, 1:] += m[1:, :-1]
+    return count
+
+
 def _agent_axes(pose):
     """World (x, z) of the agent's forward and right directions."""
     pose = np.asarray(pose, dtype=np.float64)
@@ -123,6 +211,7 @@ class OccupancyGrid:
         n = int(round(config.size_m / config.resolution))
         self.logodds = np.zeros((n, n), dtype=np.float32)
         self.origin = np.asarray(center_xz, dtype=np.float64) - config.size_m / 2.0
+        self._prev_hit = np.zeros((n, n), dtype=bool)
 
     def cells(self, points_xz):
         pts = np.atleast_2d(np.asarray(points_xz, dtype=np.float64))
@@ -150,6 +239,13 @@ class OccupancyGrid:
         return out
 
     def integrate(self, depth, pose, portal_config):
+        """Ray-cast one depth frame.
+
+        Each column contributes at most one obstacle: the nearest point in the
+        body of the image, and only when it lies inside the free-ray cap. Hits
+        count only on the second consecutive frame. One free ray is enough to
+        mark a cell walkable.
+        """
         c, pc = self.config, portal_config
         height, width = depth.shape
         s = max(1, c.pixel_stride)
@@ -161,10 +257,20 @@ class OccupancyGrid:
         hit = valid & (z < pc.depth_max - 0.05)
         x = (us - cx) * z / fx
         h = pc.camera_height - (vs - cy) * z / fx
-        obstacle = hit & (h > c.obstacle_min_h) & (h < c.obstacle_max_h)
+        # Drop the top band (ceiling, pitched roof). Keep the lower image so nearby obstacles stay.
+        body_rows = vs >= int(height * pc.body_top)
+        obstacle = hit & body_rows & (h > c.obstacle_min_h) & (h < c.obstacle_max_h)
         floor = hit & (h <= c.obstacle_min_h)
 
-        nearest = np.where(obstacle, z, np.inf).min(axis=0)
+        z_obs = np.where(obstacle, z, np.inf)
+        cols = np.arange(z_obs.shape[1])
+        nearest_row = np.argmin(z_obs, axis=0)
+        nearest = z_obs[nearest_row, cols]
+        keep = np.isfinite(nearest) & (nearest <= c.free_cap_m + self.res)
+        near_pts = np.stack(
+            [x[nearest_row[keep], cols[keep]], nearest[keep]], axis=1
+        ) if keep.any() else np.zeros((0, 2), dtype=np.float64)
+
         floor_far = np.where(floor, z, 0.0).max(axis=0)
         open_ray = (valid & ~hit).any(axis=0)
         reach = np.where(
@@ -180,8 +286,7 @@ class OccupancyGrid:
         ray_z = np.broadcast_to(t[:, None], inside.shape)[inside]
         ray_x = (t[:, None] * slope[None, :])[inside]
 
-        occ = self._flat(camera_xz_to_world(np.stack([x[obstacle], z[obstacle]], axis=1), pose)) \
-            if obstacle.any() else np.zeros(0, dtype=np.int64)
+        occ = self._flat(camera_xz_to_world(near_pts, pose)) if len(near_pts) else np.zeros(0, dtype=np.int64)
         free = self._flat(camera_xz_to_world(np.stack([ray_x, ray_z], axis=1), pose)) \
             if ray_z.size else np.zeros(0, dtype=np.int64)
         free = np.setdiff1d(free, occ, assume_unique=True)
@@ -191,13 +296,48 @@ class OccupancyGrid:
         gx, gz = np.meshgrid(g, g)
         disk = np.stack([gx.ravel(), gz.ravel()], axis=1)
         disk = disk[np.linalg.norm(disk, axis=1) <= r]
-        body = self._flat(disk + np.asarray(pose)[[0, 2], 3])
+        foot = self._flat(disk + np.asarray(pose)[[0, 2], 3])
 
         lo = self.logodds.reshape(-1)
         lo[free] -= c.miss_logodds
-        lo[occ] += c.hit_logodds
-        lo[body] = np.minimum(lo[body], c.free_logodds - c.miss_logodds)
+        if self._prev_hit.shape != self.logodds.shape:
+            self._prev_hit = np.zeros(self.logodds.shape, dtype=bool)
+        hit_now = np.zeros(lo.shape, dtype=bool)
+        hit_now[occ] = True
+        confirmed = hit_now & self._prev_hit.reshape(-1)
+        lo[confirmed] += c.hit_logodds
+        self._prev_hit = hit_now.reshape(self.logodds.shape)
+        lo[foot] = np.minimum(lo[foot], c.free_logodds - c.miss_logodds)
         np.clip(lo, -c.clamp_logodds, c.clamp_logodds, out=lo)
+        self._cleanup()
+
+    def _cleanup(self):
+        """Drop obstacle islands with no free corridor, then fill speckled unknown cells."""
+        c = self.config
+        lo = self.logodds
+        free = lo < c.free_logodds
+        occ = lo > c.occupied_logodds
+        if occ.any() and free.any():
+            seed = occ & _dilate(free, c.wall_gap_cells)
+            keep = seed.copy()
+            allowed = occ
+            for _ in range(6):
+                grown = _dilate(keep, 1) & allowed
+                if np.array_equal(grown, keep):
+                    break
+                keep = grown
+            lo[occ & ~keep] = 0.0
+            occ = lo > c.occupied_logodds
+            speck = occ & (_neighbor_count(occ) <= 1) & _dilate(free, 1)
+            lo[speck] = 0.0
+        for _ in range(c.hole_cells):
+            free = lo < c.free_logodds
+            occ = lo > c.occupied_logodds
+            known = free | occ
+            holes = (~known) & (_neighbor_count(known) >= 6) & (_neighbor_count(free) >= 4)
+            if not holes.any():
+                break
+            lo[holes] = c.free_logodds - 0.05
 
     def known_bounds(self):
         """World (x, z) min and max of all known cells, or ``None``."""
@@ -271,6 +411,7 @@ class PortalMap:
         self.pose = None
         self.step = -1
         self._next_id = 1
+        self._alias = {}
         c = self.config
         g = np.arange(-c.behind_radius_m, c.behind_radius_m + 1e-6, c.resolution)
         gx, gz = np.meshgrid(g, g)
@@ -296,7 +437,16 @@ class PortalMap:
         self.grid.integrate(depth, pose, self.portal_config)
 
         openings, edges, dropped = detect(depth, self.portal_config)
-        obs = [o for o in (self._observe(p, depth.shape, pose) for p in openings + edges) if o]
+        obs, rejected = [], []
+        for portal in openings + edges:
+            o = self._observe(portal, depth.shape, pose)
+            if o is None:
+                continue
+            # A border opening wider than a door has one unreliable jamb. Keep it only as a sighting.
+            if (not o["full"]) and o["width"] > self.config.partial_max_m:
+                rejected.append(o)
+            else:
+                obs.append(o)
         assigned = self._associate(obs)
         labels, seen = [], set()
         for i, o in enumerate(obs):
@@ -308,13 +458,19 @@ class PortalMap:
             self._update_best(tr, o, step, frame)
             labels.append((o["portal"], tr.id))
             seen.add(tr.id)
-        # A gated-out detection still shows the doorway is there; it must not count as a miss.
+        # A gated-out or oversized detection still shows the doorway is there; it must not count as a miss.
+        for o in rejected:
+            seen.update(tr.id for tr in self.tracks if self._compatible(o, tr) is not None)
         for portal in dropped:
             o = self._observe(portal, depth.shape, pose)
             if o is None:
                 continue
             seen.update(tr.id for tr in self.tracks if self._compatible(o, tr) is not None)
 
+        self._alias = {}
+        self._merge_tracks()
+        labels = [(portal, self._resolve(track_id)) for portal, track_id in labels]
+        seen = {self._resolve(track_id) for track_id in seen}
         self._count_misses(depth, pose, seen)
         if self.trajectory:
             self._check_traversal(self.trajectory[-1], agent_xz)
@@ -348,28 +504,34 @@ class PortalMap:
             "normal": normal,
             "real": real,
             "full": full,
+            "width": float(np.linalg.norm(b - a)),
             "weight": (1.0 if full else 0.5) / jamb ** 2,
             "view_score": (1.0 if full else 0.3) * centered / jamb,
         }
 
     def _compatible(self, o, tr):
-        """Association cost in meters, or ``None`` if ``o`` cannot be ``tr``."""
+        """Association cost in meters, or ``None`` if ``o`` cannot be ``tr``.
+
+        A close or crossing pair may differ by ``close_angle_deg``. Farther pairs
+        keep the tighter ``assoc_angle_deg``, so a distant oblique false opening
+        does not attach to a real door.
+        """
         c = self.config
+        if not _same_opening(
+            o["a"], o["b"], tr.a, tr.b, c.assoc_dist_m, c.merge_endpoint_m, c.merge_overlap_m
+        ):
+            return None
+        sep = _segment_sep(o["a"], o["b"], tr.a, tr.b)
         cos = abs(float(np.dot(_unit(o["b"] - o["a"]), _unit(tr.b - tr.a))))
-        if cos < math.cos(math.radians(c.assoc_angle_deg)):
+        limit = c.close_angle_deg if sep <= c.close_dist_m else c.assoc_angle_deg
+        if cos < math.cos(math.radians(limit)):
             return None
-        d = min(
-            _point_segment_dist(o["center"], tr.a, tr.b),
-            _point_segment_dist(tr.center, o["a"], o["b"]),
-        )
-        if d > c.assoc_dist_m:
-            return None
-        if o["full"] and tr.full:
+        if o["full"] and tr.full and sep > c.close_dist_m:
             w0 = float(np.linalg.norm(o["b"] - o["a"]))
             ratio = max(w0, tr.width) / max(min(w0, tr.width), 1e-3)
             if ratio > c.width_ratio:
                 return None
-        return d
+        return sep
 
     def _associate(self, obs):
         pairs = []
@@ -403,26 +565,82 @@ class PortalMap:
         return tr
 
     def _merge(self, tr, o, step):
-        a, b, real, w = o["a"], o["b"], list(o["real"]), o["weight"]
-        if np.linalg.norm(a - tr.a) + np.linalg.norm(b - tr.b) > np.linalg.norm(a - tr.b) + np.linalg.norm(b - tr.a):
-            a, b, real = b, a, real[::-1]
-        if o["full"] and not tr.full:
-            tr.a, tr.b, tr.weight, tr.full = a.copy(), b.copy(), w, True
-        elif o["full"] or not tr.full:
+        """Fold one detection into a track. Geometry follows the clearest full view.
+
+        Averaging oblique views rotates the segment and splits one door into
+        crossing tracks. A better centered full view replaces the endpoints.
+        A border view never moves a full track.
+        """
+        previous = tr.best["score"] if tr.best else -1.0
+        replace = o["full"] and (not tr.full or o["view_score"] > previous)
+        if replace:
+            tr.a = o["a"].copy()
+            tr.b = o["b"].copy()
+            tr.normal = o["normal"].copy()
+            tr.full = True
+            tr.weight = o["weight"]
+        elif not tr.full:
+            a, b, w = o["a"], o["b"], o["weight"]
+            if np.linalg.norm(a - tr.a) + np.linalg.norm(b - tr.b) > np.linalg.norm(a - tr.b) + np.linalg.norm(b - tr.a):
+                a, b = b, a
             total = tr.weight + w
             tr.a = (tr.a * tr.weight + a * w) / total
             tr.b = (tr.b * tr.weight + b * w) / total
             tr.weight = total
-        else:
-            # A partial view of a full track: its border end is not a jamb.
-            if real[0]:
-                tr.a = (tr.a * tr.weight + a * w) / (tr.weight + w)
-            if real[1]:
-                tr.b = (tr.b * tr.weight + b * w) / (tr.weight + w)
-        normal = _unit(_perp(tr.b - tr.a))
-        tr.normal = normal if np.dot(normal, tr.normal) >= 0 else -normal
+            normal = _unit(_perp(tr.b - tr.a))
+            tr.normal = normal if np.dot(normal, tr.normal) >= 0 else -normal
         tr.hits += 1
         tr.last_step = step
+
+    def _resolve(self, track_id):
+        seen = set()
+        while track_id in self._alias and track_id not in seen:
+            seen.add(track_id)
+            track_id = self._alias[track_id]
+        return track_id
+
+    def _same_track_opening(self, left, right):
+        c = self.config
+        return _same_opening(
+            left.a, left.b, right.a, right.b, c.merge_dist_m, c.merge_endpoint_m, c.merge_overlap_m
+        )
+
+    def _merge_tracks(self):
+        """Collapse doorway tracks that already overlap. Ids of the kept track stay put."""
+        merged = True
+        while merged:
+            merged = False
+            live = [tr for tr in self.tracks if not tr.abandoned]
+            live.sort(key=lambda tr: (tr.full, tr.best["score"] if tr.best else 0.0, tr.hits, -tr.id), reverse=True)
+            for i, keep in enumerate(live):
+                for drop in live[i + 1:]:
+                    if not self._same_track_opening(keep, drop):
+                        continue
+                    self._absorb(keep, drop)
+                    merged = True
+                    break
+                if merged:
+                    break
+
+    def _absorb(self, keep, drop):
+        drop_score = drop.best["score"] if drop.best else -1.0
+        keep_score = keep.best["score"] if keep.best else -1.0
+        if drop.full and (not keep.full or drop_score > keep_score + 0.05):
+            keep.a = drop.a.copy()
+            keep.b = drop.b.copy()
+            keep.normal = drop.normal.copy()
+            keep.full = True
+            keep.weight = drop.weight
+        keep.hits += drop.hits
+        keep.misses = min(keep.misses, drop.misses)
+        keep.first_step = min(keep.first_step, drop.first_step)
+        keep.last_step = max(keep.last_step, drop.last_step)
+        keep.traversed = keep.traversed or drop.traversed
+        keep.weight = max(keep.weight, drop.weight)
+        if drop.best and (keep.best is None or drop.best["score"] > keep.best["score"]):
+            keep.best = drop.best
+        self._alias[drop.id] = keep.id
+        self.tracks = [tr for tr in self.tracks if tr.id != drop.id]
 
     def _update_best(self, tr, o, step, frame):
         if tr.best is None or o["view_score"] > tr.best["score"]:
@@ -488,11 +706,29 @@ class PortalMap:
             return "traversed"
         if tr.blocked or score <= c.invalid_score:
             return "invalid"
+        # One jamb is not enough to offer the doorway as a goal.
+        if not tr.full:
+            return "candidate"
         if tr.explored:
             return "explored"
         if tr.hits >= c.confirm_hits and score >= c.confirm_score:
             return "confirmed"
         return "candidate"
+
+    def _hidden_ids(self):
+        """Lower-quality tracks that still overlap a better one. Merge should have removed these."""
+        ranked = sorted(
+            (tr for tr in self.tracks if tr.state not in ("invalid", "abandoned")),
+            key=lambda tr: (tr.full, tr.best["score"] if tr.best else 0.0, tr.hits, -tr.id),
+            reverse=True,
+        )
+        kept, hidden = [], set()
+        for tr in ranked:
+            if any(self._same_track_opening(tr, other) for other in kept):
+                hidden.add(tr.id)
+            else:
+                kept.append(tr)
+        return hidden
 
     def describe(self, states=ACTIVE):
         """One line per portal, nearest first, relative to the current agent heading."""
@@ -500,9 +736,10 @@ class PortalMap:
             return []
         agent = self.pose[[0, 2], 3]
         fwd, right = _agent_axes(self.pose)
+        hidden = self._hidden_ids()
         rows = []
         for tr in self.tracks:
-            if tr.state not in states:
+            if tr.state not in states or tr.id in hidden:
                 continue
             d = tr.center - agent
             bearing = math.degrees(math.atan2(float(d @ right), float(d @ fwd)))
@@ -558,7 +795,10 @@ class PortalMap:
         if len(self.trajectory) > 1:
             draw.line([to_px(p) for p in self.trajectory], fill=TRAJECTORY, width=2)
         font = _load_font(16)
+        hidden = self._hidden_ids()
         for tr in self.tracks:
+            if tr.id in hidden:
+                continue
             color = STATE_COLORS[tr.state]
             draw.line([to_px(tr.a), to_px(tr.b)], fill=color, width=5)
             tip = to_px(tr.center + tr.normal * 0.4)
