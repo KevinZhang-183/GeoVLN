@@ -48,6 +48,8 @@ class MapConfig:
     obstacle_min_h: float = 0.15
     obstacle_max_h: float = 1.6
     free_cap_m: float = 5.0
+    behind_gap_m: float = 0.2
+    behind_max_m: float = 2.5
     agent_radius_m: float = 0.2
     hit_logodds: float = 0.85
     miss_logodds: float = 0.55
@@ -175,6 +177,21 @@ def _dilate(mask, radius=1):
     return cur
 
 
+def _erode(mask):
+    """One-cell erosion. A cell stays only when all eight neighbors are set."""
+    cur = np.asarray(mask, dtype=bool)
+    nxt = cur.copy()
+    nxt[1:] &= cur[:-1]
+    nxt[:-1] &= cur[1:]
+    nxt[:, 1:] &= cur[:, :-1]
+    nxt[:, :-1] &= cur[:, 1:]
+    nxt[1:, 1:] &= cur[:-1, :-1]
+    nxt[:-1, :-1] &= cur[1:, 1:]
+    nxt[1:, :-1] &= cur[:-1, 1:]
+    nxt[:-1, 1:] &= cur[1:, :-1]
+    return nxt
+
+
 def _neighbor_count(mask):
     m = np.asarray(mask, dtype=np.uint8)
     count = np.zeros(m.shape, dtype=np.uint8)
@@ -211,7 +228,6 @@ class OccupancyGrid:
         n = int(round(config.size_m / config.resolution))
         self.logodds = np.zeros((n, n), dtype=np.float32)
         self.origin = np.asarray(center_xz, dtype=np.float64) - config.size_m / 2.0
-        self._prev_hit = np.zeros((n, n), dtype=bool)
 
     def cells(self, points_xz):
         pts = np.atleast_2d(np.asarray(points_xz, dtype=np.float64))
@@ -241,10 +257,10 @@ class OccupancyGrid:
     def integrate(self, depth, pose, portal_config):
         """Ray-cast one depth frame.
 
-        Each column contributes at most one obstacle: the nearest point in the
-        body of the image, and only when it lies inside the free-ray cap. Hits
-        count only on the second consecutive frame. One free ray is enough to
-        mark a cell walkable.
+        The nearest obstacle stops the forward ray. Floor and the next wall
+        seen within ``behind_max_m`` of that surface are written too, so the
+        ground behind a table stays explored. One hit marks an obstacle.
+        The top of the image is ignored, and nothing past ``free_cap_m`` is drawn.
         """
         c, pc = self.config, portal_config
         height, width = depth.shape
@@ -259,34 +275,52 @@ class OccupancyGrid:
         h = pc.camera_height - (vs - cy) * z / fx
         # Drop the top band (ceiling, pitched roof). Keep the lower image so nearby obstacles stay.
         body_rows = vs >= int(height * pc.body_top)
-        obstacle = hit & body_rows & (h > c.obstacle_min_h) & (h < c.obstacle_max_h)
-        floor = hit & (h <= c.obstacle_min_h)
+        near_cap = z <= c.free_cap_m + self.res
+        obstacle = hit & body_rows & near_cap & (h > c.obstacle_min_h) & (h < c.obstacle_max_h)
+        floor = hit & body_rows & near_cap & (h <= c.obstacle_min_h)
 
         z_obs = np.where(obstacle, z, np.inf)
         cols = np.arange(z_obs.shape[1])
         nearest_row = np.argmin(z_obs, axis=0)
         nearest = z_obs[nearest_row, cols]
-        keep = np.isfinite(nearest) & (nearest <= c.free_cap_m + self.res)
+        has = np.isfinite(nearest)
         near_pts = np.stack(
-            [x[nearest_row[keep], cols[keep]], nearest[keep]], axis=1
-        ) if keep.any() else np.zeros((0, 2), dtype=np.float64)
+            [x[nearest_row[has], cols[has]], nearest[has]], axis=1
+        ) if has.any() else np.zeros((0, 2), dtype=np.float64)
 
-        floor_far = np.where(floor, z, 0.0).max(axis=0)
-        open_ray = (valid & ~hit).any(axis=0)
-        reach = np.where(
-            np.isfinite(nearest),
-            nearest - self.res,
-            np.where(open_ray, c.free_cap_m, floor_far),
-        )
+        gap = c.behind_gap_m
+        past = nearest[None, :] + gap
+        limit = nearest[None, :] + c.behind_max_m
+        floor_behind = floor & (z > past) & (z <= limit)
+        floor_end = np.where(floor_behind, z, 0.0).max(axis=0)
+        wall_behind = obstacle & (z > past) & (z <= limit)
+        far_z = np.where(wall_behind, z, 0.0).max(axis=0)
+        wall_pts = np.stack(
+            [x[wall_behind], z[wall_behind]], axis=1
+        ) if wall_behind.any() else np.zeros((0, 2), dtype=np.float64)
+        behind_end = np.maximum(floor_end, np.where(far_z > 0, far_z - self.res, 0.0))
+
+        floor_only = np.where(floor, z, 0.0).max(axis=0)
+        open_ray = (valid & ~hit & body_rows).any(axis=0)
+        reach = np.where(has, nearest - self.res, np.where(open_ray, c.free_cap_m, floor_only))
         reach = np.clip(reach, 0.0, c.free_cap_m)
 
         t = np.arange(0.0, c.free_cap_m, self.res)
         slope = (us[0] - cx) / fx
-        inside = t[:, None] < reach[None, :]
-        ray_z = np.broadcast_to(t[:, None], inside.shape)[inside]
-        ray_x = (t[:, None] * slope[None, :])[inside]
+        front = t[:, None] < reach[None, :]
+        start = np.where(has, nearest + gap, np.inf)
+        behind = (t[:, None] >= start[None, :]) & (t[:, None] <= behind_end[None, :])
+        ray_z = np.concatenate([
+            np.broadcast_to(t[:, None], front.shape)[front],
+            np.broadcast_to(t[:, None], behind.shape)[behind],
+        ])
+        ray_x = np.concatenate([
+            (t[:, None] * slope[None, :])[front],
+            (t[:, None] * slope[None, :])[behind],
+        ])
 
-        occ = self._flat(camera_xz_to_world(near_pts, pose)) if len(near_pts) else np.zeros(0, dtype=np.int64)
+        occ_pts = near_pts if len(wall_pts) == 0 else np.concatenate([near_pts, wall_pts], axis=0)
+        occ = self._flat(camera_xz_to_world(occ_pts, pose)) if len(occ_pts) else np.zeros(0, dtype=np.int64)
         free = self._flat(camera_xz_to_world(np.stack([ray_x, ray_z], axis=1), pose)) \
             if ray_z.size else np.zeros(0, dtype=np.int64)
         free = np.setdiff1d(free, occ, assume_unique=True)
@@ -300,19 +334,13 @@ class OccupancyGrid:
 
         lo = self.logodds.reshape(-1)
         lo[free] -= c.miss_logodds
-        if self._prev_hit.shape != self.logodds.shape:
-            self._prev_hit = np.zeros(self.logodds.shape, dtype=bool)
-        hit_now = np.zeros(lo.shape, dtype=bool)
-        hit_now[occ] = True
-        confirmed = hit_now & self._prev_hit.reshape(-1)
-        lo[confirmed] += c.hit_logodds
-        self._prev_hit = hit_now.reshape(self.logodds.shape)
+        lo[occ] += c.hit_logodds
         lo[foot] = np.minimum(lo[foot], c.free_logodds - c.miss_logodds)
         np.clip(lo, -c.clamp_logodds, c.clamp_logodds, out=lo)
         self._cleanup()
 
     def _cleanup(self):
-        """Drop obstacle islands with no free corridor, then fill speckled unknown cells."""
+        """Drop detached obstacles, keep thin walls, and close one-cell notches."""
         c = self.config
         lo = self.logodds
         free = lo < c.free_logodds
@@ -320,16 +348,18 @@ class OccupancyGrid:
         if occ.any() and free.any():
             seed = occ & _dilate(free, c.wall_gap_cells)
             keep = seed.copy()
-            allowed = occ
-            for _ in range(6):
-                grown = _dilate(keep, 1) & allowed
+            for _ in range(8):
+                grown = _dilate(keep, 1) & occ
                 if np.array_equal(grown, keep):
                     break
                 keep = grown
             lo[occ & ~keep] = 0.0
             occ = lo > c.occupied_logodds
-            speck = occ & (_neighbor_count(occ) <= 1) & _dilate(free, 1)
-            lo[speck] = 0.0
+            isolated = occ & (_neighbor_count(occ) == 0) & (_neighbor_count(free) >= 5)
+            lo[isolated] = 0.0
+            occ = lo > c.occupied_logodds
+            closed = _erode(_dilate(occ, 1))
+            lo[closed & ~occ] = c.occupied_logodds + 0.05
         for _ in range(c.hole_cells):
             free = lo < c.free_logodds
             occ = lo > c.occupied_logodds
