@@ -37,6 +37,8 @@ STATE_COLORS = {
     "invalid": (220, 40, 40),
     "abandoned": (90, 90, 90),
 }
+# Invalid openings are rejected; explored space is already on the occupancy grid.
+UNDRAWN = ("invalid", "explored")
 ACTIVE = ("candidate", "confirmed")
 
 
@@ -799,7 +801,7 @@ class PortalMap:
         font = _load_font(16)
         hidden = self._hidden_ids()
         for tr in self.tracks:
-            if tr.id in hidden:
+            if tr.id in hidden or tr.state in UNDRAWN:
                 continue
             color = STATE_COLORS[tr.state]
             draw.line([to_px(tr.a), to_px(tr.b)], fill=color, width=5)
