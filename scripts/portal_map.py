@@ -56,6 +56,7 @@ class MapConfig:
     free_logodds: float = -0.4
     hole_cells: int = 3
     wall_gap_cells: int = 3
+    hit_match_cells: int = 2
     assoc_dist_m: float = 0.5
     assoc_angle_deg: float = 35.0
     close_dist_m: float = 0.45
@@ -242,9 +243,10 @@ class OccupancyGrid:
         """Ray-cast one depth frame.
 
         Each column contributes at most one obstacle: the nearest point in the
-        body of the image, and only when it lies inside the free-ray cap. Hits
-        count only on the second consecutive frame. One free ray is enough to
-        mark a cell walkable.
+        body of the image, and only when it lies inside the free-ray cap. A hit
+        counts when this frame lands within ``hit_match_cells`` of the previous
+        frame, so a few centimeters of jitter still builds the wall. One free
+        ray is enough to mark a cell walkable.
         """
         c, pc = self.config, portal_config
         height, width = depth.shape
@@ -302,11 +304,11 @@ class OccupancyGrid:
         lo[free] -= c.miss_logodds
         if self._prev_hit.shape != self.logodds.shape:
             self._prev_hit = np.zeros(self.logodds.shape, dtype=bool)
-        hit_now = np.zeros(lo.shape, dtype=bool)
-        hit_now[occ] = True
-        confirmed = hit_now & self._prev_hit.reshape(-1)
-        lo[confirmed] += c.hit_logodds
-        self._prev_hit = hit_now.reshape(self.logodds.shape)
+        hit_now = np.zeros(self.logodds.shape, dtype=bool)
+        hit_now.reshape(-1)[occ] = True
+        repeated = _dilate(self._prev_hit, c.hit_match_cells) if c.hit_match_cells else self._prev_hit
+        lo[hit_now.reshape(-1) & repeated.reshape(-1)] += c.hit_logodds
+        self._prev_hit = hit_now
         lo[foot] = np.minimum(lo[foot], c.free_logodds - c.miss_logodds)
         np.clip(lo, -c.clamp_logodds, c.clamp_logodds, out=lo)
         self._cleanup()
