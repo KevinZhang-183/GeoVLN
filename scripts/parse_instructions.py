@@ -345,12 +345,13 @@ def run(args: argparse.Namespace) -> None:
         if raw and not parsed:
             item["raw"] = raw
         finished.append(item)
-        state = item["end_landmark"] if parsed else "FAILED"
         if parsed:
-            item_end = parsed["end_landmark"]
-            print(f"[{index}/{len(rows)}] {row['scene_id']} {row['episode_id']} -> {item_end}", flush=True)
+            print(
+                f"[{index}/{len(rows)}] {row['scene_id']} {row['episode_id']} -> {parsed['end_landmark']}",
+                flush=True,
+            )
         else:
-            print(f"[{index}/{len(rows)}] {row['scene_id']} {row['episode_id']} -> {state}", flush=True)
+            print(f"[{index}/{len(rows)}] {row['scene_id']} {row['episode_id']} -> FAILED", flush=True)
         if index % 10 == 0 or index == len(rows):
             _dump(args, client, finished)
 
