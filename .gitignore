@@ -39,3 +39,7 @@ video_results/
 *.bin
 *.safetensors
 *.onnx
+
+# 本地笔记和冒烟脚本
+*.md
+scripts/sam3_smoke.py

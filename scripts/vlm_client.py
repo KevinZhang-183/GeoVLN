@@ -8,6 +8,7 @@
 - ``VLM_BASE_URL``  默认 ``http://127.0.0.1:8000/v1``
 - ``VLM_API_KEY``   默认 ``EMPTY``
 - ``VLM_MODEL``     默认 ``Qwen2.5-VL-7B-Instruct``
+- ``VLM_NUM_CTX``   默认 ``8192``。Ollama 会按模型自带的 128k 上下文预留内存，7B 视觉模型大约要 50 GB，48 GB 显卡会因此整份落到 CPU。
 """
 
 from __future__ import annotations
@@ -84,18 +85,25 @@ class VLMClient:
         self.api_key = api_key if api_key is not None else (os.environ.get("VLM_API_KEY") or "EMPTY")
         self.model = model or os.environ.get("VLM_MODEL") or "Qwen2.5-VL-7B-Instruct"
         self.timeout = timeout
+        self.num_ctx = int(os.environ.get("VLM_NUM_CTX") or "8192")
 
     def warmup(self, keep_alive: str = "30m", timeout: int = 900) -> None:
         """让 Ollama 先把权重装进显存。装载用单独的超时，之后的请求才受 self.timeout 限制。"""
         origin = self.base_url[: -len("/v1")] if self.base_url.endswith("/v1") else self.base_url
         url = origin.rstrip("/") + "/api/generate"
-        payload = {"model": self.model, "keep_alive": keep_alive, "stream": False}
-        print(f"loading {self.model}; per-request timeout of {self.timeout}s starts after this", flush=True)
+        print(f"loading {self.model} with num_ctx={self.num_ctx}", flush=True)
+        self._post_url(url, {"model": self.model, "keep_alive": 0, "stream": False}, timeout=120)
+        payload = {
+            "model": self.model,
+            "keep_alive": keep_alive,
+            "stream": False,
+            "options": {"num_ctx": self.num_ctx},
+        }
         started = time.perf_counter()
         status, detail = self._post_url(url, payload, timeout)
         if status == 400:
             payload["prompt"] = "ok"
-            payload["options"] = {"num_predict": 1}
+            payload["options"] = {"num_ctx": self.num_ctx, "num_predict": 1}
             status, detail = self._post_url(url, payload, timeout)
         if status == 404 and "not found" in detail.lower() and "model" not in detail.lower():
             print("no Ollama preload endpoint, continuing", file=sys.stderr)
@@ -103,6 +111,7 @@ class VLMClient:
         if status != 200:
             raise SystemExit(f"model {self.model} did not load: {detail}")
         print(f"model ready in {time.perf_counter() - started:.0f}s", flush=True)
+        self._require_gpu(origin)
 
     def complete(self, text: str, images=None, max_tokens=1024, temperature=0.0) -> str | None:
         """返回模型文本。网络错误、HTTP 错误、空回复都返回 None。"""
@@ -115,6 +124,7 @@ class VLMClient:
             "messages": [{"role": "user", "content": content}],
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "options": {"num_ctx": self.num_ctx},
         }
         body = self._post("/chat/completions", payload)
         if not body:
@@ -176,17 +186,43 @@ class VLMClient:
             print("VLM returned a body that is not JSON", file=sys.stderr)
             return None
 
-    def _post_url(self, url: str, payload: dict, timeout: int) -> tuple[int, str]:
-        data = json.dumps(payload).encode("utf-8")
+    def _require_gpu(self, origin: str) -> None:
+        status, detail = self._post_url(origin.rstrip("/") + "/api/ps", None, timeout=30, limit=8000)
+        if status != 200:
+            print(f"could not read ollama ps: {detail}", file=sys.stderr)
+            return
+        try:
+            models = json.loads(detail).get("models") or []
+        except json.JSONDecodeError:
+            print("ollama ps was not JSON", file=sys.stderr)
+            return
+        resident = next((item for item in models if self.model in (item.get("name"), item.get("model"))), None)
+        if resident is None:
+            print(f"{self.model} is not in ollama ps after loading", file=sys.stderr)
+            return
+        size_vram = int(resident.get("size_vram") or 0)
+        context = resident.get("context_length") or resident.get("context")
+        print(
+            f"resident size_vram={size_vram / 2**30:.1f} GiB context={context}",
+            flush=True,
+        )
+        if size_vram <= 0:
+            raise SystemExit(
+                f"{self.model} is loaded with num_ctx={self.num_ctx} but size_vram is 0. "
+                "Ollama is still not using the GPU."
+            )
+
+    def _post_url(self, url: str, payload: dict | None, timeout: int, limit: int = 400) -> tuple[int, str]:
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+            headers={} if payload is None else {"Content-Type": "application/json"},
+            method="GET" if payload is None else "POST",
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.status, response.read().decode("utf-8", errors="replace")[:400]
+                return response.status, response.read().decode("utf-8", errors="replace")[:limit]
         except TimeoutError:
             return 0, f"timed out after {timeout}s"
         except urllib.error.HTTPError as exc:
