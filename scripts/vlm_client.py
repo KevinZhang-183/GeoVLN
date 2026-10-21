@@ -17,6 +17,7 @@ import io
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -84,6 +85,25 @@ class VLMClient:
         self.model = model or os.environ.get("VLM_MODEL") or "Qwen2.5-VL-7B-Instruct"
         self.timeout = timeout
 
+    def warmup(self, keep_alive: str = "30m", timeout: int = 900) -> None:
+        """让 Ollama 先把权重装进显存。装载用单独的超时，之后的请求才受 self.timeout 限制。"""
+        origin = self.base_url[: -len("/v1")] if self.base_url.endswith("/v1") else self.base_url
+        url = origin.rstrip("/") + "/api/generate"
+        payload = {"model": self.model, "keep_alive": keep_alive, "stream": False}
+        print(f"loading {self.model}; per-request timeout of {self.timeout}s starts after this", flush=True)
+        started = time.perf_counter()
+        status, detail = self._post_url(url, payload, timeout)
+        if status == 400:
+            payload["prompt"] = "ok"
+            payload["options"] = {"num_predict": 1}
+            status, detail = self._post_url(url, payload, timeout)
+        if status == 404 and "not found" in detail.lower() and "model" not in detail.lower():
+            print("no Ollama preload endpoint, continuing", file=sys.stderr)
+            return
+        if status != 200:
+            raise SystemExit(f"model {self.model} did not load: {detail}")
+        print(f"model ready in {time.perf_counter() - started:.0f}s", flush=True)
+
     def complete(self, text: str, images=None, max_tokens=1024, temperature=0.0) -> str | None:
         """返回模型文本。网络错误、HTTP 错误、空回复都返回 None。"""
         content = []
@@ -140,6 +160,9 @@ class VLMClient:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 raw = response.read().decode("utf-8")
+        except TimeoutError:
+            print(f"VLM request timed out after {self.timeout}s", file=sys.stderr)
+            return None
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:400]
             print(f"VLM HTTP {exc.code}: {detail}", file=sys.stderr)
@@ -152,3 +175,22 @@ class VLMClient:
         except json.JSONDecodeError:
             print("VLM returned a body that is not JSON", file=sys.stderr)
             return None
+
+    def _post_url(self, url: str, payload: dict, timeout: int) -> tuple[int, str]:
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.status, response.read().decode("utf-8", errors="replace")[:400]
+        except TimeoutError:
+            return 0, f"timed out after {timeout}s"
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:400]
+            return exc.code, f"HTTP {exc.code}: {detail}"
+        except urllib.error.URLError as exc:
+            return 0, f"request failed: {exc.reason}"

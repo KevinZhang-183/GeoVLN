@@ -330,6 +330,7 @@ def run(args: argparse.Namespace) -> None:
                 done[(str(row["scene_id"]), str(row["episode_id"]))] = row
 
     client = VLMClient(base_url=args.base_url, api_key=args.api_key, model=args.model)
+    client.warmup()
     finished = []
     for index, row in enumerate(rows, start=1):
         key = (str(row["scene_id"]), row["episode_id"])
