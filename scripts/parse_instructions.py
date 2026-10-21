@@ -63,24 +63,66 @@ DIRECTION_ONLY = {
     "up",
     "down",
 }
-ROOM_ONLY = {
+ROOM_WORDS = {
     "kitchen",
     "bedroom",
     "bathroom",
     "hallway",
     "hall",
     "corridor",
-    "living room",
-    "dining room",
+    "living",
+    "dining",
     "office",
     "lobby",
     "garage",
     "balcony",
     "closet",
-    "laundry room",
+    "laundry",
     "foyer",
     "entryway",
     "room",
+    "den",
+    "study",
+    "patio",
+    "porch",
+    "lounge",
+}
+OBJECT_WORDS = {
+    "door",
+    "doors",
+    "doorway",
+    "doorways",
+    "stair",
+    "stairs",
+    "staircase",
+    "stairway",
+    "table",
+    "chair",
+    "chairs",
+    "oven",
+    "ovens",
+    "plant",
+    "plants",
+    "pot",
+    "pots",
+    "flower",
+    "flowers",
+    "fireplace",
+    "refrigerator",
+    "fridge",
+    "counter",
+    "rug",
+    "window",
+    "picture",
+    "sofa",
+    "couch",
+    "bed",
+    "sink",
+    "toilet",
+    "cabinet",
+    "lamp",
+    "mirror",
+    "railing",
 }
 
 PROMPT = """Convert one indoor navigation instruction into an ordered chain of visual landmarks.
@@ -100,7 +142,10 @@ Rules:
 - action is one of: exit, enter, go_to, pass, turn, stop.
 - landmark is a short English noun phrase for something that can be segmented: a door, doorway, stairs, furniture, appliance, plant, window, picture, counter, rug. Three words or fewer when possible.
 - Do not use a bare direction (left, right, forward) as a landmark.
-- Do not use a bare room name (kitchen, bedroom, hallway) as a landmark. If the instruction only names a room, use that room's doorway and put the room name in end_context or done_when.
+- Do not use a room name as a landmark. If the instruction passes through or stops at a room, the landmark is that room's door or doorway, such as "bathroom doorway". Put the room name in done_when or end_context.
+- A landmark must be a physical thing named in the instruction. Put relations such as "left", "second", and "by the flower pot" in done_when or end_context. Do not invent a noun such as "hallway left" or "staircase door".
+- "Through the doorway by X" means the landmark is the doorway. X only identifies which doorway.
+- Do not invent an object the instruction does not name, and do not split one stop into two landmarks.
 - The last subtask is where the instruction says to stop. Its action is stop, and end_landmark copies that landmark.
 - end_context is a short list of phrases that distinguish this stop location from other copies of the same object.
 - Use 2 to 6 subtasks. Fold "walk straight" into the next landmark. A turn still needs the object or doorway that marks where to turn.
@@ -173,6 +218,14 @@ def _clean_phrase(value) -> str:
     return " ".join(str(value).strip().strip(".").split())
 
 
+def _place_only(landmark: str) -> bool:
+    """房间名，或房间名再加方位。没有门、楼梯、家具这类可分割物体。"""
+    words = [word for word in landmark.lower().split() if word not in {"the", "a", "an", "of"}]
+    if not words or any(word in OBJECT_WORDS for word in words):
+        return False
+    return any(word in ROOM_WORDS for word in words)
+
+
 def _action(value) -> str | None:
     name = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
     if name in ACTIONS:
@@ -204,12 +257,10 @@ def validate(parsed: dict) -> tuple[dict | None, list[str], list[str]]:
             errors.append(f"subtask {index} has an unknown action")
         if not landmark or len(landmark.split()) > 8:
             errors.append(f"subtask {index} landmark is empty or longer than 8 words")
-        elif landmark.lower() in DIRECTION_ONLY:
-            errors.append(f"subtask {index} landmark is only a direction")
+        elif landmark.lower() in DIRECTION_ONLY or _place_only(landmark):
+            errors.append(f"subtask {index} landmark is a room or direction, not a segmentable object")
         if not done:
             errors.append(f"subtask {index} is missing done_when")
-        if landmark.lower() in ROOM_ONLY:
-            flags.append(f"subtask {index} landmark is a room name: {landmark}")
         if landmark and len(landmark.split()) > 4:
             flags.append(f"subtask {index} landmark is long: {landmark}")
         if action and landmark and done:
@@ -291,11 +342,10 @@ def write_review(path: Path, rows: list[dict], review_n: int, seed: int) -> None
 def summarize(rows: list[dict]) -> str:
     parsed = [row for row in rows if row.get("parsed")]
     flagged = [row for row in parsed if row.get("flags")]
-    room = sum(1 for row in parsed if any("room name" in flag for flag in row["flags"]))
     not_stop = sum(1 for row in parsed if any("not stop" in flag for flag in row["flags"]))
     return (
         f"parsed {len(parsed)}/{len(rows)}  "
-        f"flagged {len(flagged)}  room_name {room}  last_not_stop {not_stop}  "
+        f"flagged {len(flagged)}  last_not_stop {not_stop}  "
         f"failed {len(rows) - len(parsed)}"
     )
 
@@ -401,15 +451,32 @@ def self_check() -> None:
     )
     assert blocked is None and errors
 
-    room, errors, flags = validate(
+    room, errors, _flags = validate(
         {
             "subtasks": [{"action": "stop", "landmark": "kitchen", "done_when": "inside the kitchen"}],
             "end_landmark": "kitchen",
             "end_context": [],
         }
     )
-    assert room is not None and not errors
-    assert any("room name" in flag for flag in flags)
+    assert room is None and any("segmentable" in error for error in errors)
+    shifted, errors, _flags = validate(
+        {
+            "subtasks": [{"action": "turn", "landmark": "hallway left", "done_when": "turned left"}],
+            "end_landmark": "hallway left",
+            "end_context": [],
+        }
+    )
+    assert shifted is None and errors
+    doorway, errors, _flags = validate(
+        {
+            "subtasks": [
+                {"action": "stop", "landmark": "bathroom doorway", "done_when": "at the bathroom doorway"}
+            ],
+            "end_landmark": "bathroom doorway",
+            "end_context": ["bathroom"],
+        }
+    )
+    assert doorway is not None and not errors
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
