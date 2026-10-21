@@ -89,7 +89,7 @@ class VLMClient:
 
     def warmup(self, keep_alive: str = "30m", timeout: int = 900) -> None:
         """让 Ollama 先把权重装进显存。装载用单独的超时，之后的请求才受 self.timeout 限制。"""
-        origin = self.base_url[: -len("/v1")] if self.base_url.endswith("/v1") else self.base_url
+        origin = self._origin()
         url = origin.rstrip("/") + "/api/generate"
         print(f"loading {self.model} with num_ctx={self.num_ctx}", flush=True)
         self._post_url(url, {"model": self.model, "keep_alive": 0, "stream": False}, timeout=120)
@@ -113,8 +113,16 @@ class VLMClient:
         print(f"model ready in {time.perf_counter() - started:.0f}s", flush=True)
         self._require_gpu(origin)
 
+    def _origin(self) -> str:
+        if self.base_url.endswith("/v1"):
+            return self.base_url[: -len("/v1")]
+        return self.base_url
+
     def complete(self, text: str, images=None, max_tokens=1024, temperature=0.0) -> str | None:
         """返回模型文本。网络错误、HTTP 错误、空回复都返回 None。"""
+        native = self._complete_native(text, images, max_tokens, temperature)
+        if native is not False:
+            return native
         content = []
         for image in images or []:
             content.append({"type": "image_url", "image_url": {"url": _data_url(image)}})
@@ -124,7 +132,6 @@ class VLMClient:
             "messages": [{"role": "user", "content": content}],
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "options": {"num_ctx": self.num_ctx},
         }
         body = self._post("/chat/completions", payload)
         if not body:
@@ -137,6 +144,46 @@ class VLMClient:
         if isinstance(message, list):
             message = "".join(part.get("text", "") for part in message if isinstance(part, dict))
         text_out = (message or "").strip()
+        return text_out or None
+
+    def _complete_native(self, text: str, images, max_tokens: int, temperature: float):
+        """走 Ollama 的 /api/chat。OpenAI 兼容接口会忽略 num_ctx，模型会按 128k 上下文反复分配显存。"""
+        message = {"role": "user", "content": text}
+        encoded = []
+        for image in images or []:
+            encoded.append(_data_url(image).split(",", 1)[1])
+        if encoded:
+            message["images"] = encoded
+        payload = {
+            "model": self.model,
+            "messages": [message],
+            "stream": False,
+            "keep_alive": "30m",
+            "options": {
+                "num_ctx": self.num_ctx,
+                "temperature": temperature,
+                "num_predict": max_tokens,
+            },
+        }
+        status, detail = self._post_url(
+            self._origin().rstrip("/") + "/api/chat",
+            payload,
+            self.timeout,
+            limit=200_000,
+        )
+        if status == 404:
+            return False
+        if status != 200:
+            print(f"VLM request failed: {detail}", file=sys.stderr)
+            return None
+        try:
+            content = json.loads(detail).get("message", {}).get("content")
+        except json.JSONDecodeError:
+            print("VLM returned a body that is not JSON", file=sys.stderr)
+            return None
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+        text_out = (content or "").strip()
         return text_out or None
 
     def complete_json(self, text: str, images=None, max_tokens=1024, temperature=0.0, retries=1) -> dict | None:
