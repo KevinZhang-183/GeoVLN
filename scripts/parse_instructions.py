@@ -155,7 +155,7 @@ action is one of:
 - go_to: walk to, into, through or past the landmark.
 - exit: leave a room. landmark is the room being left, or "" if it is not named.
 - turn_left, turn_right, turn_around: only when the instruction says turn, take a left/right, or turn around. landmark, near and side are "".
-- stop: always the last step. landmark is where to stop.
+- stop: only the last step, where the instruction says to stop or wait. "Stand in front of", "face", and "turn to face" are go_to, not stop.
 landmark is the place to reach, in 1 to 3 words: an object, door, doorway or room.
 near is another object named only to locate the landmark, else "". In "the doorway by the flower pot", landmark is "doorway" and near is "flower pot".
 side is "left" or "right" when the instruction says which side the landmark is on, else "". "On your left" and "to the right of" set side. They are not turns.
@@ -312,6 +312,14 @@ def validate(parsed: dict) -> tuple[dict | None, list[str], list[str]]:
         out.append(_step(action, landmark, near, side))
     if errors:
         return None, errors, flags
+
+    earlier_stops = 0
+    for step in out[:-1]:
+        if step["action"] == "stop":
+            step["action"] = "go_to"
+            earlier_stops += 1
+    if earlier_stops:
+        flags.append(f"rewrote {earlier_stops} earlier stop steps as go_to")
 
     if not out or out[-1]["action"] != "stop":
         flags.append("added missing stop")
@@ -574,6 +582,24 @@ def self_check() -> None:
     )
     assert not errors, errors
     assert [(s["action"], s["near"]) for s in folded["subtasks"]] == [("stop", "flower pot")]
+
+    faced, errors, flags = validate(
+        {
+            "steps": [
+                {"action": "go_to", "landmark": "couch", "side": "right"},
+                {"action": "stop", "landmark": "grill"},
+                {"action": "turn_right", "landmark": ""},
+                {"action": "go_to", "landmark": "microwaves"},
+                {"action": "stop", "landmark": "doorway"},
+            ]
+        }
+    )
+    assert not errors, errors
+    assert [s["action"] for s in faced["subtasks"]] == ["go_to", "go_to", "turn_right", "go_to", "stop"]
+    assert faced["subtasks"][1]["landmark"] == "grill"
+    assert faced["subtasks"][-1]["landmark"] == "doorway"
+    assert faced["end_landmark"] == "doorway"
+    assert any("earlier stop" in flag for flag in flags)
 
     room, errors, flags = validate({"steps": [{"action": "stop", "landmark": "kitchen"}]})
     assert room is not None and any("stop landmark is a room" in flag for flag in flags)
