@@ -468,7 +468,9 @@ def run(args: argparse.Namespace) -> None:
             if row.get("parsed"):
                 done[(str(row["scene_id"]), str(row["episode_id"]))] = row
 
-    client = VLMClient(base_url=args.base_url, api_key=args.api_key, model=args.model)
+    client = VLMClient(
+        base_url=args.base_url, api_key=args.api_key, model=args.model, num_ctx=args.num_ctx
+    )
     client.warmup()
     finished = []
     for index, row in enumerate(rows, start=1):
@@ -659,7 +661,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true", help="沿用输出文件里已经解析成功的条目")
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--api-key", default=None)
-    parser.add_argument("--model", default=None)
+    parser.add_argument("--model", default=None, help="覆盖 VLM_MODEL，例如 qwen3-vl:32b-instruct-q4_K_M")
+    parser.add_argument("--num-ctx", type=int, default=None, help="覆盖 VLM_NUM_CTX。单张 48GB 跑 32B 用 8192")
     parser.add_argument("--self-check", action="store_true", help="不访问模型，只检查解析和校验")
     parser.add_argument("--dry-run", action="store_true", help="打印第一条指令的提示词后退出")
     args = parser.parse_args()

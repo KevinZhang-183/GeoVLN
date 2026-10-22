@@ -80,12 +80,12 @@ def _data_url(image) -> str:
 
 
 class VLMClient:
-    def __init__(self, base_url=None, api_key=None, model=None, timeout=180):
+    def __init__(self, base_url=None, api_key=None, model=None, timeout=180, num_ctx=None):
         self.base_url = (base_url or os.environ.get("VLM_BASE_URL") or "http://127.0.0.1:8000/v1").rstrip("/")
         self.api_key = api_key if api_key is not None else (os.environ.get("VLM_API_KEY") or "EMPTY")
         self.model = model or os.environ.get("VLM_MODEL") or "Qwen2.5-VL-7B-Instruct"
         self.timeout = timeout
-        self.num_ctx = int(os.environ.get("VLM_NUM_CTX") or "8192")
+        self.num_ctx = int(num_ctx if num_ctx is not None else (os.environ.get("VLM_NUM_CTX") or "8192"))
 
     def warmup(self, keep_alive: str = "30m", timeout: int = 900) -> None:
         """让 Ollama 先把权重装进显存。装载用单独的超时，之后的请求才受 self.timeout 限制。"""
