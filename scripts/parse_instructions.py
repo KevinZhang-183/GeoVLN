@@ -323,18 +323,23 @@ def validate(parsed: dict) -> tuple[dict | None, list[str], list[str]]:
     deduped = []
     for step in out:
         last = deduped[-1] if deduped else None
-        if last and step["landmark"] and step["landmark"] == last["landmark"] and step["action"] != "exit":
+        # 同一类物体可以出现多次，near 或 side 不同就是另一步。只合并紧挨着的同一次到达。
+        if last and step["action"] != "exit" and _same_place(step, last):
             if step["action"] == "stop":
                 last["action"] = "stop"
-            last["near"] = last["near"] or step["near"]
-            last["side"] = last["side"] or step["side"]
             continue
         deduped.append(step)
 
     landmarks = []
+    seen = set()
     for step in deduped:
-        if step["action"] != "exit" and step["landmark"] and step["landmark"] not in landmarks:
-            landmarks.append(step["landmark"])
+        if step["action"] == "exit" or not step["landmark"]:
+            continue
+        key = (step["landmark"], step["near"], step["side"])
+        if key in seen:
+            continue
+        seen.add(key)
+        landmarks.append(step["landmark"])
     if not landmarks:
         return None, ["no step has a landmark; name the objects, doors or rooms from the instruction"], flags
 
@@ -346,6 +351,14 @@ def validate(parsed: dict) -> tuple[dict | None, list[str], list[str]]:
     if _place_only(subtasks[-1]["landmark"]):
         flags.append(f"stop landmark is a room: {subtasks[-1]['landmark']}")
     return {"subtasks": subtasks, "landmarks": landmarks, "end_landmark": landmarks[-1]}, [], flags
+
+
+def _same_place(left: dict, right: dict) -> bool:
+    return bool(left["landmark"]) and (
+        left["landmark"], left["near"], left["side"]
+    ) == (
+        right["landmark"], right["near"], right["side"]
+    )
 
 
 def _step(action: str, landmark: str = "", near: str = "", side: str = "") -> dict:
@@ -536,6 +549,31 @@ def self_check() -> None:
         ("stop", "door", "recycling bin", ""),
     ]
     assert any("missing stop" in flag for flag in flags)
+
+    doorways, errors, flags = validate(
+        {
+            "steps": [
+                {"action": "go_to", "landmark": "doorway", "near": "dining room table", "side": "right"},
+                {"action": "go_to", "landmark": "doorway", "near": "flower pot", "side": ""},
+                {"action": "stop", "landmark": "doorway", "near": "staircase", "side": "left"},
+            ]
+        }
+    )
+    assert not errors, errors
+    assert [(s["action"], s["near"], s["side"]) for s in doorways["subtasks"]] == [
+        ("go_to", "dining room table", "right"),
+        ("go_to", "flower pot", ""),
+        ("stop", "staircase", "left"),
+    ]
+    assert doorways["landmarks"] == ["doorway", "doorway", "doorway"]
+    assert not flags
+
+    folded, errors, _flags = validate(
+        {"steps": [{"action": "go_to", "landmark": "doorway", "near": "flower pot"},
+                   {"action": "stop", "landmark": "doorway", "near": "flower pot"}]}
+    )
+    assert not errors, errors
+    assert [(s["action"], s["near"]) for s in folded["subtasks"]] == [("stop", "flower pot")]
 
     room, errors, flags = validate({"steps": [{"action": "stop", "landmark": "kitchen"}]})
     assert room is not None and any("stop landmark is a room" in flag for flag in flags)
