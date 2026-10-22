@@ -5,8 +5,9 @@
 所以这一步不需要再打开 Habitat 数据集。没有这条字段时，用 --dataset 按
 scene_id + episode_id 去 json/json.gz 里补。
 
-动作只有 go_to / turn_left / turn_right / stop 四类。地标照抄指令里的物体、门或房间，
-房间名不拒收，只打标记，留给下游换成门洞或交给 VLM。
+动作有 go_to / exit / turn_left / turn_right / turn_around / stop 六类。每步的 landmark
+是要到达的目标，near 是只用来定位目标的参照物，side 是目标在左还是右。
+exit 的 landmark 是被离开的房间，不进 landmarks 列表。房间名不拒收，终点是房间时打标记。
 
 在服务器上，先让 vLLM 提供 OpenAI 兼容接口，再：
 
@@ -25,6 +26,7 @@ import argparse
 import gzip
 import json
 import random
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -35,7 +37,8 @@ from select_r2r_subset import load_episodes  # noqa: E402
 from vlm_client import VLMClient, extract_json  # noqa: E402
 
 
-ACTIONS = ("go_to", "turn_left", "turn_right", "stop")
+ACTIONS = ("go_to", "exit", "turn_left", "turn_right", "turn_around", "stop")
+TURNS = ("turn_left", "turn_right", "turn_around")
 ACTION_ALIAS = {
     "go": "go_to",
     "goto": "go_to",
@@ -44,8 +47,11 @@ ACTION_ALIAS = {
     "move_to": "go_to",
     "approach": "go_to",
     "find": "go_to",
-    "exit": "go_to",
-    "leave": "go_to",
+    "leave": "exit",
+    "walk_out": "exit",
+    "go_out": "exit",
+    "get_out": "exit",
+    "exit_room": "exit",
     "enter": "go_to",
     "pass": "go_to",
     "go_past": "go_to",
@@ -57,12 +63,17 @@ ACTION_ALIAS = {
     "follow": "go_to",
     "left": "turn_left",
     "right": "turn_right",
+    "turn_back": "turn_around",
+    "u_turn": "turn_around",
+    "turn_180": "turn_around",
     "wait": "stop",
     "halt": "stop",
     "stop_at": "stop",
 }
-TURN_AROUND = {"turn_around", "turn_back", "u_turn"}
 ARTICLES = {"the", "a", "an"}
+SIDE_PREFIX = re.compile(r"^(?:to\s+)?(?:the\s+)?(left|right)(?:\s+side)?\s+of\s+(.+)$")
+SIDE_SUFFIX = re.compile(r"^(.+?)\s+(?:on|to)\s+(?:the|your)\s+(left|right)$")
+NEAR_SPLIT = re.compile(r"^(.+?)\s+(?:next to|near|beside|by)\s+(.+)$")
 DIRECTION_ONLY = {
     "left",
     "right",
@@ -139,18 +150,26 @@ OBJECT_WORDS = {
 
 PROMPT = """Split the navigation instruction into steps, in order.
 
-Each step is {"action": ..., "landmark": ...}.
-action is one of: go_to, turn_left, turn_right, stop.
-landmark is the object, door or room the instruction names, in 1 to 3 words. turn_left and turn_right have landmark "".
-"Turn around" is two turn_right steps. The last step is stop, with the place to stop as its landmark.
+Each step is {"action": ..., "landmark": ..., "near": ..., "side": ...}.
+action is one of:
+- go_to: walk to, into, through or past the landmark.
+- exit: leave a room. landmark is the room being left, or "" if it is not named.
+- turn_left, turn_right, turn_around: only when the instruction says turn, take a left/right, or turn around. landmark, near and side are "".
+- stop: always the last step. landmark is where to stop.
+landmark is the place to reach, in 1 to 3 words: an object, door, doorway or room.
+near is another object named only to locate the landmark, else "". In "the doorway by the flower pot", landmark is "doorway" and near is "flower pot".
+side is "left" or "right" when the instruction says which side the landmark is on, else "". "On your left" and "to the right of" set side. They are not turns.
 
 Reply with JSON only: {"steps": [...]}
 
-Instruction: Walk out of the bedroom, turn left, go past the stairs, and stop next to the potted plant.
-{"steps": [{"action": "go_to", "landmark": "bedroom door"}, {"action": "turn_left", "landmark": ""}, {"action": "go_to", "landmark": "stairs"}, {"action": "stop", "landmark": "potted plant"}]}
+Instruction: Turn around and walk out of the bedroom. Go past the stairs and stop next to the potted plant.
+{"steps": [{"action": "turn_around", "landmark": "", "near": "", "side": ""}, {"action": "exit", "landmark": "bedroom", "near": "", "side": ""}, {"action": "go_to", "landmark": "stairs", "near": "", "side": ""}, {"action": "stop", "landmark": "potted plant", "near": "", "side": ""}]}
 
-Instruction: Go down the hallway, turn right into the kitchen, and wait in front of the refrigerator.
-{"steps": [{"action": "go_to", "landmark": "hallway"}, {"action": "turn_right", "landmark": ""}, {"action": "go_to", "landmark": "kitchen"}, {"action": "stop", "landmark": "refrigerator"}]}
+Instruction: Walk down the hallway to the second doorway on your left. Turn left into the kitchen and wait in front of the refrigerator.
+{"steps": [{"action": "go_to", "landmark": "second doorway", "near": "", "side": "left"}, {"action": "turn_left", "landmark": "", "near": "", "side": ""}, {"action": "go_to", "landmark": "kitchen", "near": "", "side": ""}, {"action": "stop", "landmark": "refrigerator", "near": "", "side": ""}]}
+
+Instruction: Go through the doorway to the right of the table, then stop at the door by the flower pot.
+{"steps": [{"action": "go_to", "landmark": "doorway", "near": "table", "side": "right"}, {"action": "stop", "landmark": "door", "near": "flower pot", "side": ""}]}
 
 Instruction: {instruction}
 """
@@ -223,10 +242,28 @@ def _place_only(landmark: str) -> bool:
     return any(word in ROOM_WORDS for word in words)
 
 
+def _side(value) -> str:
+    text = str(value or "").lower()
+    has_left, has_right = "left" in text, "right" in text
+    if has_left == has_right:
+        return ""
+    return "left" if has_left else "right"
+
+
+def _split_side(landmark: str) -> tuple[str, str]:
+    """把 "left of living area"、"doorway on your left" 拆成 (地标, 方位)。"""
+    match = SIDE_PREFIX.match(landmark)
+    if match:
+        return _landmark(match.group(2)), match.group(1)
+    match = SIDE_SUFFIX.match(landmark)
+    if match:
+        return _landmark(match.group(1)), match.group(2)
+    return landmark, ""
+
+
 def _action(value, raw_landmark) -> str | None:
-    """归到四类动作。turn_around 单独返回，由调用方展开成两次右转。"""
     name = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
-    if name in ACTIONS or name in TURN_AROUND:
+    if name in ACTIONS:
         return name
     if name == "turn":
         side = str(raw_landmark or "").strip().lower()
@@ -254,59 +291,72 @@ def validate(parsed: dict) -> tuple[dict | None, list[str], list[str]]:
             continue
         raw_landmark = item.get("landmark", "")
         action = _action(item.get("action"), raw_landmark)
-        landmark = _landmark(raw_landmark)
         if action is None:
             errors.append(f"step {index} action {item.get('action')!r} is not one of {', '.join(ACTIONS)}")
             continue
-        if action in TURN_AROUND:
-            out += [{"action": "turn_right", "landmark": ""}, {"action": "turn_right", "landmark": ""}]
-            continue
-        if action in ("turn_left", "turn_right"):
+        landmark, split_side = _split_side(_landmark(raw_landmark))
+        side = _side(item.get("side")) or split_side
+        near = _landmark(item.get("near"))
+        match = NEAR_SPLIT.match(landmark)
+        if match and not near:
+            landmark, near = _landmark(match.group(1)), _landmark(match.group(2))
+        if near == landmark:
+            near = ""
+        if action in TURNS:
             if landmark:
-                out.append({"action": "go_to", "landmark": landmark})
-            out.append({"action": action, "landmark": ""})
+                out.append(_step("go_to", landmark, near, side))
+            out.append(_step(action))
             continue
         if action == "go_to" and not landmark:
             continue
-        out.append({"action": action, "landmark": landmark})
+        out.append(_step(action, landmark, near, side))
     if errors:
         return None, errors, flags
 
     if not out or out[-1]["action"] != "stop":
         flags.append("added missing stop")
-        out.append({"action": "stop", "landmark": ""})
+        out.append(_step("stop"))
     if not out[-1]["landmark"] and len(out) >= 2 and out[-2]["action"] == "go_to":
-        out[-1]["landmark"] = out.pop(-2)["landmark"]
+        previous = out.pop(-2)
+        out[-1].update(landmark=previous["landmark"], near=previous["near"], side=previous["side"])
 
     deduped = []
     for step in out:
-        if deduped and step["landmark"] and step["landmark"] == deduped[-1]["landmark"]:
-            deduped[-1]["action"] = step["action"] if step["action"] == "stop" else deduped[-1]["action"]
+        last = deduped[-1] if deduped else None
+        if last and step["landmark"] and step["landmark"] == last["landmark"] and step["action"] != "exit":
+            if step["action"] == "stop":
+                last["action"] = "stop"
+            last["near"] = last["near"] or step["near"]
+            last["side"] = last["side"] or step["side"]
             continue
         deduped.append(step)
 
     landmarks = []
     for step in deduped:
-        if step["landmark"] and step["landmark"] not in landmarks:
+        if step["action"] != "exit" and step["landmark"] and step["landmark"] not in landmarks:
             landmarks.append(step["landmark"])
     if not landmarks:
         return None, ["no step has a landmark; name the objects, doors or rooms from the instruction"], flags
 
+    subtasks = []
     for index, step in enumerate(deduped, start=1):
-        step["id"] = index
         if len(step["landmark"].split()) > 4:
             flags.append(f"step {index} landmark is long: {step['landmark']}")
-        if _place_only(step["landmark"]):
-            flags.append(f"step {index} landmark is a room: {step['landmark']}")
-    subtasks = [{"id": step["id"], "action": step["action"], "landmark": step["landmark"]} for step in deduped]
+        subtasks.append({"id": index, **step})
+    if _place_only(subtasks[-1]["landmark"]):
+        flags.append(f"stop landmark is a room: {subtasks[-1]['landmark']}")
     return {"subtasks": subtasks, "landmarks": landmarks, "end_landmark": landmarks[-1]}, [], flags
+
+
+def _step(action: str, landmark: str = "", near: str = "", side: str = "") -> dict:
+    return {"action": action, "landmark": landmark, "near": near, "side": side}
 
 
 def parse_one(client: VLMClient, instruction: str, retries: int = 1) -> tuple[dict | None, list[str], str | None]:
     errors: list[str] | None = None
     last_raw = None
     for _ in range(retries + 1):
-        raw = client.complete(build_prompt(instruction, errors), max_tokens=400, temperature=0.0, json_mode=True)
+        raw = client.complete(build_prompt(instruction, errors), max_tokens=700, temperature=0.0, json_mode=True)
         last_raw = raw
         parsed = extract_json(raw or "")
         if parsed is None:
@@ -328,7 +378,7 @@ def write_review(path: Path, rows: list[dict], review_n: int, seed: int) -> None
         "# 指令解析抽查",
         "",
         f"共 {len(rows)} 条，这里抽 {len(picked)} 条（seed={seed}）。",
-        "看三件事：步骤顺序和转向对不对、地标有没有漏或编造、终点地标对不对。",
+        "看四件事：步骤顺序和转向对不对、方位修饰有没有被误当成转向、目标和参照物有没有颠倒、终点地标对不对。",
         "",
     ]
     for row in picked:
@@ -344,7 +394,12 @@ def write_review(path: Path, rows: list[dict], review_n: int, seed: int) -> None
         lines.append(f"终点：{parsed['end_landmark']}")
         lines.append("地标：" + " -> ".join(parsed["landmarks"]))
         for item in parsed["subtasks"]:
-            lines.append(f"{item['id']}. {item['action']} {item['landmark']}".rstrip())
+            detail = item["landmark"]
+            if item.get("side"):
+                detail += f" [{item['side']}]"
+            if item.get("near"):
+                detail += f" (near {item['near']})"
+            lines.append(f"{item['id']}. {item['action']} {detail}".rstrip())
         flags = row.get("flags") or []
         lines.append("标记：" + ("；".join(flags) if flags else "无"))
         lines.append("")
@@ -446,36 +501,44 @@ def self_check() -> None:
     normalized, errors, flags = validate(
         {
             "steps": [
-                {"action": "exit", "landmark": "the bedroom door"},
+                {"action": "turn back", "landmark": ""},
+                {"action": "leave", "landmark": "the bathroom"},
                 {"action": "turn", "landmark": "left"},
                 {"action": "walk", "landmark": "forward"},
                 {"action": "turn right", "landmark": "stairs"},
+                {"action": "go_to", "landmark": "doorway", "near": "Flower pot", "side": "on your right"},
                 {"action": "stop", "landmark": "Potted plant."},
             ]
         }
     )
     assert not errors, errors
-    assert [(s["action"], s["landmark"]) for s in normalized["subtasks"]] == [
-        ("go_to", "bedroom door"),
-        ("turn_left", ""),
-        ("go_to", "stairs"),
-        ("turn_right", ""),
-        ("stop", "potted plant"),
+    assert [(s["action"], s["landmark"], s["near"], s["side"]) for s in normalized["subtasks"]] == [
+        ("turn_around", "", "", ""),
+        ("exit", "bathroom", "", ""),
+        ("turn_left", "", "", ""),
+        ("go_to", "stairs", "", ""),
+        ("turn_right", "", "", ""),
+        ("go_to", "doorway", "flower pot", "right"),
+        ("stop", "potted plant", "", ""),
     ]
-    assert [s["id"] for s in normalized["subtasks"]] == [1, 2, 3, 4, 5]
-    assert normalized["landmarks"] == ["bedroom door", "stairs", "potted plant"]
+    assert [s["id"] for s in normalized["subtasks"]] == [1, 2, 3, 4, 5, 6, 7]
+    assert normalized["landmarks"] == ["stairs", "doorway", "potted plant"]
     assert normalized["end_landmark"] == "potted plant"
     assert not flags
 
     merged, errors, flags = validate(
-        {"steps": [{"action": "go_to", "landmark": "kitchen"}, {"action": "turn_around", "landmark": ""},
-                   {"action": "go_to", "landmark": "table"}]}
+        {"steps": [{"action": "go_to", "landmark": "left of living area"},
+                   {"action": "go_to", "landmark": "door next to recycling bin"}]}
     )
     assert not errors, errors
-    assert [s["action"] for s in merged["subtasks"]] == ["go_to", "turn_right", "turn_right", "stop"]
-    assert merged["subtasks"][-1]["landmark"] == "table"
+    assert [(s["action"], s["landmark"], s["near"], s["side"]) for s in merged["subtasks"]] == [
+        ("go_to", "living area", "", "left"),
+        ("stop", "door", "recycling bin", ""),
+    ]
     assert any("missing stop" in flag for flag in flags)
-    assert any("room" in flag for flag in flags)
+
+    room, errors, flags = validate({"steps": [{"action": "stop", "landmark": "kitchen"}]})
+    assert room is not None and any("stop landmark is a room" in flag for flag in flags)
 
     blocked, errors, _flags = validate({"steps": [{"action": "go_to", "landmark": "left"}]})
     assert blocked is None and any("no step has a landmark" in error for error in errors)
