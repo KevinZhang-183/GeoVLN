@@ -5,7 +5,8 @@
 所以这一步不需要再打开 Habitat 数据集。没有这条字段时，用 --dataset 按
 scene_id + episode_id 去 json/json.gz 里补。
 
-地标短语要能交给 SAM 做文本分割：具体物体或门洞，不单写房间名或方向。
+动作只有 go_to / turn_left / turn_right / stop 四类。地标照抄指令里的物体、门或房间，
+房间名不拒收，只打标记，留给下游换成门洞或交给 VLM。
 
 在服务器上，先让 vLLM 提供 OpenAI 兼容接口，再：
 
@@ -34,23 +35,34 @@ from select_r2r_subset import load_episodes  # noqa: E402
 from vlm_client import VLMClient, extract_json  # noqa: E402
 
 
-ACTIONS = ("exit", "enter", "go_to", "pass", "turn", "stop")
+ACTIONS = ("go_to", "turn_left", "turn_right", "stop")
 ACTION_ALIAS = {
-    "leave": "exit",
-    "walk_out": "exit",
-    "go_out": "exit",
-    "walk": "go_to",
     "go": "go_to",
+    "goto": "go_to",
+    "walk": "go_to",
+    "walk_to": "go_to",
+    "move_to": "go_to",
     "approach": "go_to",
     "find": "go_to",
-    "pass_by": "pass",
-    "go_past": "pass",
-    "walk_past": "pass",
-    "turn_left": "turn",
-    "turn_right": "turn",
+    "exit": "go_to",
+    "leave": "go_to",
+    "enter": "go_to",
+    "pass": "go_to",
+    "go_past": "go_to",
+    "walk_past": "go_to",
+    "go_through": "go_to",
+    "go_up": "go_to",
+    "go_down": "go_to",
+    "climb": "go_to",
+    "follow": "go_to",
+    "left": "turn_left",
+    "right": "turn_right",
     "wait": "stop",
     "halt": "stop",
+    "stop_at": "stop",
 }
+TURN_AROUND = {"turn_around", "turn_back", "u_turn"}
+ARTICLES = {"the", "a", "an"}
 DIRECTION_ONLY = {
     "left",
     "right",
@@ -125,39 +137,20 @@ OBJECT_WORDS = {
     "railing",
 }
 
-PROMPT = """Convert one indoor navigation instruction into an ordered chain of visual landmarks.
+PROMPT = """Split the navigation instruction into steps, in order.
 
-A later system segments each landmark in RGB with an open-vocabulary segmenter, then walks to them in order. Keep the intermediate landmarks. Do not reduce the instruction to only the final object.
+Each step is {"action": ..., "landmark": ...}.
+action is one of: go_to, turn_left, turn_right, stop.
+landmark is the object, door or room the instruction names, in 1 to 3 words. turn_left and turn_right have landmark "".
+"Turn around" is two turn_right steps. The last step is stop, with the place to stop as its landmark.
 
-Reply with one JSON object and no other text. Schema:
-{{
-  "subtasks": [
-    {{"id": 1, "action": "exit", "landmark": "bedroom door", "done_when": "passed through the bedroom door"}}
-  ],
-  "end_landmark": "potted plant",
-  "end_context": ["hallway", "past the stairs"]
-}}
+Reply with JSON only: {"steps": [...]}
 
-Rules:
-- action is one of: exit, enter, go_to, pass, turn, stop.
-- landmark is a short English noun phrase for something that can be segmented: a door, doorway, stairs, furniture, appliance, plant, window, picture, counter, rug. Three words or fewer when possible.
-- Do not use a bare direction (left, right, forward) as a landmark.
-- Do not use a room name as a landmark. If the instruction passes through or stops at a room, the landmark is that room's door or doorway, such as "bathroom doorway". Put the room name in done_when or end_context.
-- A landmark must be a physical thing named in the instruction. Put relations such as "left", "second", and "by the flower pot" in done_when or end_context. Do not invent a noun such as "hallway left" or "staircase door".
-- "Through the doorway by X" means the landmark is the doorway. X only identifies which doorway.
-- Do not invent an object the instruction does not name, and do not split one stop into two landmarks.
-- The last subtask is where the instruction says to stop. Its action is stop, and end_landmark copies that landmark.
-- end_context is a short list of phrases that distinguish this stop location from other copies of the same object.
-- Use 2 to 6 subtasks. Fold "walk straight" into the next landmark. A turn still needs the object or doorway that marks where to turn.
-- done_when is one short condition for that subtask.
-
-Example 1
 Instruction: Walk out of the bedroom, turn left, go past the stairs, and stop next to the potted plant.
-{{"subtasks": [{{"id": 1, "action": "exit", "landmark": "bedroom door", "done_when": "passed through the bedroom door"}}, {{"id": 2, "action": "pass", "landmark": "stairs", "done_when": "the stairs are behind the agent"}}, {{"id": 3, "action": "stop", "landmark": "potted plant", "done_when": "within 1.5 m of the potted plant"}}], "end_landmark": "potted plant", "end_context": ["past the stairs", "after leaving the bedroom"]}}
+{"steps": [{"action": "go_to", "landmark": "bedroom door"}, {"action": "turn_left", "landmark": ""}, {"action": "go_to", "landmark": "stairs"}, {"action": "stop", "landmark": "potted plant"}]}
 
-Example 2
-Instruction: Go down the hallway, turn right into the kitchen, and stop in front of the refrigerator.
-{{"subtasks": [{{"id": 1, "action": "go_to", "landmark": "hallway doorway", "done_when": "entered the hallway"}}, {{"id": 2, "action": "enter", "landmark": "kitchen doorway", "done_when": "passed through the kitchen doorway"}}, {{"id": 3, "action": "stop", "landmark": "refrigerator", "done_when": "in front of the refrigerator"}}], "end_landmark": "refrigerator", "end_context": ["kitchen", "right turn from the hallway"]}}
+Instruction: Go down the hallway, turn right into the kitchen, and wait in front of the refrigerator.
+{"steps": [{"action": "go_to", "landmark": "hallway"}, {"action": "turn_right", "landmark": ""}, {"action": "go_to", "landmark": "kitchen"}, {"action": "stop", "landmark": "refrigerator"}]}
 
 Instruction: {instruction}
 """
@@ -207,90 +200,113 @@ def load_dataset_instructions(path: Path) -> dict[tuple[str, str], str]:
 
 
 def build_prompt(instruction: str, errors: list[str] | None = None) -> str:
-    prompt = PROMPT.format(instruction=instruction)
+    prompt = PROMPT.replace("{instruction}", instruction)
     if errors:
-        prompt += "\nThe previous JSON was rejected:\n- " + "\n- ".join(errors)
-        prompt += "\nReply with a corrected JSON object only."
+        prompt += "\nThe previous reply was rejected:\n- " + "\n- ".join(errors)
+        prompt += "\nReply with the corrected JSON only."
     return prompt
 
 
-def _clean_phrase(value) -> str:
-    return " ".join(str(value).strip().strip(".").split())
+def _landmark(value) -> str:
+    words = str(value or "").lower().replace(",", " ").strip().strip(".").split()
+    while words and words[0] in ARTICLES:
+        words = words[1:]
+    phrase = " ".join(words)
+    return "" if phrase in DIRECTION_ONLY else phrase
 
 
 def _place_only(landmark: str) -> bool:
     """房间名，或房间名再加方位。没有门、楼梯、家具这类可分割物体。"""
-    words = [word for word in landmark.lower().split() if word not in {"the", "a", "an", "of"}]
+    words = [word for word in landmark.split() if word not in ARTICLES | {"of"}]
     if not words or any(word in OBJECT_WORDS for word in words):
         return False
     return any(word in ROOM_WORDS for word in words)
 
 
-def _action(value) -> str | None:
+def _action(value, raw_landmark) -> str | None:
+    """归到四类动作。turn_around 单独返回，由调用方展开成两次右转。"""
     name = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
-    if name in ACTIONS:
+    if name in ACTIONS or name in TURN_AROUND:
         return name
+    if name == "turn":
+        side = str(raw_landmark or "").strip().lower()
+        return {"left": "turn_left", "right": "turn_right", "around": "turn_around"}.get(side)
     return ACTION_ALIAS.get(name)
 
 
 def validate(parsed: dict) -> tuple[dict | None, list[str], list[str]]:
-    """返回 (规范化结果, 硬错误, 软标记)。硬错误非空时结果为 None。"""
+    """返回 (规范化结果, 硬错误, 软标记)。硬错误非空时结果为 None。
+
+    能修的都在这里修，只在拿不到动作或一个地标都没有时才判失败。
+    """
     if not isinstance(parsed, dict):
-        return None, ["top level is not an object"], []
-    subtasks = parsed.get("subtasks")
-    if not isinstance(subtasks, list) or not subtasks:
-        return None, ["subtasks must be a non-empty list"], []
-    if len(subtasks) > 8:
-        return None, ["more than 8 subtasks"], []
+        return None, ["reply is not a JSON object"], []
+    steps = parsed.get("steps", parsed.get("subtasks"))
+    if not isinstance(steps, list) or not steps:
+        return None, ['"steps" must be a non-empty list'], []
 
     errors = []
     flags = []
-    cleaned = []
-    for index, item in enumerate(subtasks, start=1):
+    out = []
+    for index, item in enumerate(steps, start=1):
         if not isinstance(item, dict):
-            errors.append(f"subtask {index} is not an object")
+            errors.append(f"step {index} is not an object")
             continue
-        action = _action(item.get("action"))
-        landmark = _clean_phrase(item.get("landmark", ""))
-        done = _clean_phrase(item.get("done_when", ""))
+        raw_landmark = item.get("landmark", "")
+        action = _action(item.get("action"), raw_landmark)
+        landmark = _landmark(raw_landmark)
         if action is None:
-            errors.append(f"subtask {index} has an unknown action")
-        if not landmark or len(landmark.split()) > 8:
-            errors.append(f"subtask {index} landmark is empty or longer than 8 words")
-        elif landmark.lower() in DIRECTION_ONLY or _place_only(landmark):
-            errors.append(f"subtask {index} landmark is a room or direction, not a segmentable object")
-        if not done:
-            errors.append(f"subtask {index} is missing done_when")
-        if landmark and len(landmark.split()) > 4:
-            flags.append(f"subtask {index} landmark is long: {landmark}")
-        if action and landmark and done:
-            cleaned.append({"id": index, "action": action, "landmark": landmark, "done_when": done})
-
-    if errors or len(cleaned) != len(subtasks):
+            errors.append(f"step {index} action {item.get('action')!r} is not one of {', '.join(ACTIONS)}")
+            continue
+        if action in TURN_AROUND:
+            out += [{"action": "turn_right", "landmark": ""}, {"action": "turn_right", "landmark": ""}]
+            continue
+        if action in ("turn_left", "turn_right"):
+            if landmark:
+                out.append({"action": "go_to", "landmark": landmark})
+            out.append({"action": action, "landmark": ""})
+            continue
+        if action == "go_to" and not landmark:
+            continue
+        out.append({"action": action, "landmark": landmark})
+    if errors:
         return None, errors, flags
 
-    end = _clean_phrase(parsed.get("end_landmark", ""))
-    if end.lower() != cleaned[-1]["landmark"].lower():
-        if end:
-            flags.append(f"end_landmark {end!r} replaced by the last landmark")
-        end = cleaned[-1]["landmark"]
-    if cleaned[-1]["action"] != "stop":
-        flags.append("last action is not stop")
+    if not out or out[-1]["action"] != "stop":
+        flags.append("added missing stop")
+        out.append({"action": "stop", "landmark": ""})
+    if not out[-1]["landmark"] and len(out) >= 2 and out[-2]["action"] == "go_to":
+        out[-1]["landmark"] = out.pop(-2)["landmark"]
 
-    context = parsed.get("end_context", [])
-    if isinstance(context, str):
-        context = [context] if context.strip() else []
-    if not isinstance(context, list):
-        return None, ["end_context must be a list"], flags
-    context = [_clean_phrase(item) for item in context if _clean_phrase(item)]
-    return {"subtasks": cleaned, "end_landmark": end, "end_context": context}, [], flags
+    deduped = []
+    for step in out:
+        if deduped and step["landmark"] and step["landmark"] == deduped[-1]["landmark"]:
+            deduped[-1]["action"] = step["action"] if step["action"] == "stop" else deduped[-1]["action"]
+            continue
+        deduped.append(step)
+
+    landmarks = []
+    for step in deduped:
+        if step["landmark"] and step["landmark"] not in landmarks:
+            landmarks.append(step["landmark"])
+    if not landmarks:
+        return None, ["no step has a landmark; name the objects, doors or rooms from the instruction"], flags
+
+    for index, step in enumerate(deduped, start=1):
+        step["id"] = index
+        if len(step["landmark"].split()) > 4:
+            flags.append(f"step {index} landmark is long: {step['landmark']}")
+        if _place_only(step["landmark"]):
+            flags.append(f"step {index} landmark is a room: {step['landmark']}")
+    subtasks = [{"id": step["id"], "action": step["action"], "landmark": step["landmark"]} for step in deduped]
+    return {"subtasks": subtasks, "landmarks": landmarks, "end_landmark": landmarks[-1]}, [], flags
 
 
 def parse_one(client: VLMClient, instruction: str, retries: int = 1) -> tuple[dict | None, list[str], str | None]:
     errors: list[str] | None = None
     last_raw = None
     for _ in range(retries + 1):
-        raw = client.complete(build_prompt(instruction, errors), max_tokens=900, temperature=0.0)
+        raw = client.complete(build_prompt(instruction, errors), max_tokens=400, temperature=0.0, json_mode=True)
         last_raw = raw
         parsed = extract_json(raw or "")
         if parsed is None:
@@ -312,7 +328,7 @@ def write_review(path: Path, rows: list[dict], review_n: int, seed: int) -> None
         "# 指令解析抽查",
         "",
         f"共 {len(rows)} 条，这里抽 {len(picked)} 条（seed={seed}）。",
-        "看三件事：子任务顺序对不对、地标是不是能分割的物体、终点地标对不对。",
+        "看三件事：步骤顺序和转向对不对、地标有没有漏或编造、终点地标对不对。",
         "",
     ]
     for row in picked:
@@ -326,12 +342,9 @@ def write_review(path: Path, rows: list[dict], review_n: int, seed: int) -> None
             lines.append("")
             continue
         lines.append(f"终点：{parsed['end_landmark']}")
-        if parsed["end_context"]:
-            lines.append("上下文：" + "；".join(parsed["end_context"]))
+        lines.append("地标：" + " -> ".join(parsed["landmarks"]))
         for item in parsed["subtasks"]:
-            lines.append(
-                f"{item['id']}. {item['action']} | {item['landmark']} | {item['done_when']}"
-            )
+            lines.append(f"{item['id']}. {item['action']} {item['landmark']}".rstrip())
         flags = row.get("flags") or []
         lines.append("标记：" + ("；".join(flags) if flags else "无"))
         lines.append("")
@@ -342,10 +355,10 @@ def write_review(path: Path, rows: list[dict], review_n: int, seed: int) -> None
 def summarize(rows: list[dict]) -> str:
     parsed = [row for row in rows if row.get("parsed")]
     flagged = [row for row in parsed if row.get("flags")]
-    not_stop = sum(1 for row in parsed if any("not stop" in flag for flag in row["flags"]))
+    room_end = sum(1 for row in parsed if _place_only(row["parsed"]["end_landmark"]))
     return (
         f"parsed {len(parsed)}/{len(rows)}  "
-        f"flagged {len(flagged)}  last_not_stop {not_stop}  "
+        f"flagged {len(flagged)}  room_end {room_end}  "
         f"failed {len(rows) - len(parsed)}"
     )
 
@@ -430,53 +443,44 @@ def self_check() -> None:
     assert extract_json(fenced)["end_landmark"] == "chair"
     assert extract_json("no json here") is None
 
-    good = {
-        "subtasks": [
-            {"id": 9, "action": "leave", "landmark": "bedroom door", "done_when": "passed through"},
-            {"id": 2, "action": "stop", "landmark": "potted plant.", "done_when": "within 1.5 m"},
-        ],
-        "end_landmark": "plant",
-        "end_context": "hallway",
-    }
-    normalized, errors, flags = validate(good)
+    normalized, errors, flags = validate(
+        {
+            "steps": [
+                {"action": "exit", "landmark": "the bedroom door"},
+                {"action": "turn", "landmark": "left"},
+                {"action": "walk", "landmark": "forward"},
+                {"action": "turn right", "landmark": "stairs"},
+                {"action": "stop", "landmark": "Potted plant."},
+            ]
+        }
+    )
     assert not errors, errors
-    assert normalized["subtasks"][0]["action"] == "exit"
-    assert normalized["subtasks"][0]["id"] == 1
+    assert [(s["action"], s["landmark"]) for s in normalized["subtasks"]] == [
+        ("go_to", "bedroom door"),
+        ("turn_left", ""),
+        ("go_to", "stairs"),
+        ("turn_right", ""),
+        ("stop", "potted plant"),
+    ]
+    assert [s["id"] for s in normalized["subtasks"]] == [1, 2, 3, 4, 5]
+    assert normalized["landmarks"] == ["bedroom door", "stairs", "potted plant"]
     assert normalized["end_landmark"] == "potted plant"
-    assert normalized["end_context"] == ["hallway"]
-    assert any("replaced" in flag for flag in flags)
+    assert not flags
 
-    blocked, errors, _flags = validate(
-        {"subtasks": [{"action": "go_to", "landmark": "left", "done_when": "turned"}], "end_landmark": "left"}
+    merged, errors, flags = validate(
+        {"steps": [{"action": "go_to", "landmark": "kitchen"}, {"action": "turn_around", "landmark": ""},
+                   {"action": "go_to", "landmark": "table"}]}
     )
-    assert blocked is None and errors
+    assert not errors, errors
+    assert [s["action"] for s in merged["subtasks"]] == ["go_to", "turn_right", "turn_right", "stop"]
+    assert merged["subtasks"][-1]["landmark"] == "table"
+    assert any("missing stop" in flag for flag in flags)
+    assert any("room" in flag for flag in flags)
 
-    room, errors, _flags = validate(
-        {
-            "subtasks": [{"action": "stop", "landmark": "kitchen", "done_when": "inside the kitchen"}],
-            "end_landmark": "kitchen",
-            "end_context": [],
-        }
-    )
-    assert room is None and any("segmentable" in error for error in errors)
-    shifted, errors, _flags = validate(
-        {
-            "subtasks": [{"action": "turn", "landmark": "hallway left", "done_when": "turned left"}],
-            "end_landmark": "hallway left",
-            "end_context": [],
-        }
-    )
-    assert shifted is None and errors
-    doorway, errors, _flags = validate(
-        {
-            "subtasks": [
-                {"action": "stop", "landmark": "bathroom doorway", "done_when": "at the bathroom doorway"}
-            ],
-            "end_landmark": "bathroom doorway",
-            "end_context": ["bathroom"],
-        }
-    )
-    assert doorway is not None and not errors
+    blocked, errors, _flags = validate({"steps": [{"action": "go_to", "landmark": "left"}]})
+    assert blocked is None and any("no step has a landmark" in error for error in errors)
+    unknown, errors, _flags = validate({"steps": [{"action": "fly", "landmark": "chair"}]})
+    assert unknown is None and errors
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

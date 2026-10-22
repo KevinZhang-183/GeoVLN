@@ -118,9 +118,9 @@ class VLMClient:
             return self.base_url[: -len("/v1")]
         return self.base_url
 
-    def complete(self, text: str, images=None, max_tokens=1024, temperature=0.0) -> str | None:
-        """返回模型文本。网络错误、HTTP 错误、空回复都返回 None。"""
-        native = self._complete_native(text, images, max_tokens, temperature)
+    def complete(self, text: str, images=None, max_tokens=1024, temperature=0.0, json_mode=False) -> str | None:
+        """返回模型文本。网络错误、HTTP 错误、空回复都返回 None。json_mode 让服务端约束输出为 JSON。"""
+        native = self._complete_native(text, images, max_tokens, temperature, json_mode)
         if native is not False:
             return native
         content = []
@@ -133,6 +133,8 @@ class VLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
         body = self._post("/chat/completions", payload)
         if not body:
             return None
@@ -146,7 +148,7 @@ class VLMClient:
         text_out = (message or "").strip()
         return text_out or None
 
-    def _complete_native(self, text: str, images, max_tokens: int, temperature: float):
+    def _complete_native(self, text: str, images, max_tokens: int, temperature: float, json_mode: bool = False):
         """走 Ollama 的 /api/chat。OpenAI 兼容接口会忽略 num_ctx，模型会按 128k 上下文反复分配显存。"""
         message = {"role": "user", "content": text}
         encoded = []
@@ -165,6 +167,8 @@ class VLMClient:
                 "num_predict": max_tokens,
             },
         }
+        if json_mode:
+            payload["format"] = "json"
         status, detail = self._post_url(
             self._origin().rstrip("/") + "/api/chat",
             payload,
