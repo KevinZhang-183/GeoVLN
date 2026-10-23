@@ -45,19 +45,45 @@ PALETTE = (
 )
 
 
+DEFAULT_SAM3_WEIGHTS = os.environ.get("SAM3_WEIGHTS") or "/root/data1/models/sam3_weights"
+_WEIGHT_NAMES = ("sam3.pt", "sam3.1_multiplex.pt", "model.pt", "checkpoint.pt")
+
+
+def resolve_checkpoint(path):
+    """文件直接用。目录里优先 sam3.pt，只有一个 .pt/.pth 时用那一个。"""
+    candidate = Path(path)
+    if candidate.is_file():
+        return candidate
+    if candidate.is_dir():
+        for name in _WEIGHT_NAMES:
+            chosen = candidate / name
+            if chosen.is_file():
+                return chosen
+        weights = sorted(candidate.glob("*.pt")) + sorted(candidate.glob("*.pth"))
+        if len(weights) == 1:
+            return weights[0]
+        if weights:
+            names = ", ".join(item.name for item in weights)
+            raise SystemExit(f"{candidate} 里有多个权重，请用 --checkpoint 指定: {names}")
+    raise SystemExit(f"找不到 SAM3 权重: {candidate}")
+
+
 def load_processor(checkpoint):
     try:
         from sam3.model_builder import build_sam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor
     except ImportError as exc:
         raise SystemExit(
-            "没有装上 sam3。在服务器上：pip install -e 已克隆的 sam3 仓库，并确认权重在缓存里。"
+            "没有装上 sam3。在服务器上：pip install -e 已克隆的 sam3 仓库。"
             f"\n原始错误: {exc}"
         ) from exc
-    kwargs = {}
-    if checkpoint:
-        kwargs["checkpoint_path"] = checkpoint
-    return Sam3Processor(build_sam3_image_model(**kwargs))
+    checkpoint_path = str(resolve_checkpoint(checkpoint))
+    print(f"SAM3 checkpoint: {checkpoint_path}", flush=True)
+    try:
+        model = build_sam3_image_model(checkpoint_path=checkpoint_path, load_from_HF=False)
+    except TypeError:
+        model = build_sam3_image_model(checkpoint_path=checkpoint_path)
+    return Sam3Processor(model)
 
 
 def _numpy(value):
@@ -175,7 +201,11 @@ def main():
     parser.add_argument("--out-name", default="semantic_map")
     parser.add_argument("--stride", type=int, default=4, help="每隔多少帧跑一次 SAM3，默认 4")
     parser.add_argument("--min-score", type=float, default=0.45)
-    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument(
+        "--checkpoint",
+        default=DEFAULT_SAM3_WEIGHTS,
+        help="SAM3 权重文件或目录，默认 /root/data1/models/sam3_weights，也可用 SAM3_WEIGHTS",
+    )
     parser.add_argument("--no-frames", action="store_true", help="不写叠了掩码的 RGB，仍写 map.jpg 和 json")
     args = parser.parse_args()
     if not args.frames and not args.episode:
