@@ -121,7 +121,7 @@ def collect_one(env, episode, out_dir: Path, parsed_instruction: str, max_steps:
     unreachable = False
     while waypoint < len(reference) and len(frames) < max_steps and not env.episode_over:
         action = int(follower.get_next_action(reference[waypoint]))
-        if action == HabitatSimActions.STOP:
+        if action == HabitatSimActions.stop:
             if not _near_waypoint(env.sim, reference[waypoint], goal_radius):
                 unreachable = True
                 break
