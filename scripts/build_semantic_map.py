@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import torch
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -90,17 +91,25 @@ def _numpy(value):
     if value is None:
         return None
     if hasattr(value, "detach"):
-        value = value.detach().cpu().numpy()
+        value = value.detach()
+        # NumPy has no bfloat16. Autocast returns scores in that dtype.
+        if value.is_floating_point() and value.dtype != torch.float32:
+            value = value.float()
+        value = value.cpu().numpy()
     return np.asarray(value)
 
 
 def segment_prompts(processor, image, prompts):
     """Encode the image once, then run each text prompt. Yields (prompt, masks, scores)."""
-    state = processor.set_image(image)
-    for prompt in prompts:
-        output = processor.set_text_prompt(state=state, prompt=prompt)
-        masks = _numpy(output.get("masks"))
-        scores = _numpy(output.get("scores"))
+    # The fused ViT MLP writes bfloat16 activations while Linear weights stay float32.
+    # Autocast casts those weights for the matmul, which is how Meta runs SAM3.
+    encoded = []
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        state = processor.set_image(image)
+        for prompt in prompts:
+            output = processor.set_text_prompt(state=state, prompt=prompt)
+            encoded.append((prompt, _numpy(output.get("masks")), _numpy(output.get("scores"))))
+    for prompt, masks, scores in encoded:
         if masks is None:
             continue
         if masks.ndim == 4:
