@@ -4,12 +4,16 @@ The portal map is built separately by build_portal_map.py. This script does
 not read it. Both write JSON in the episode folder; combining them comes later.
 
 Each episode folder needs rgb/*.jpg, depth/*.npy and meta.json. Prompts come
-from parsed_instructions.json, or from --prompts.
+from parsed_instructions.json, or from --prompts. SAM3 runs when the agent has
+moved 0.5 m or turned 30 degrees since the last segmentation; the first and
+last frames always run. Pass --stride to sample every N frames instead.
+
+The output folder is also packed into <episode>/<out-name>.zip, replacing any
+archive already there.
 
     python scripts/build_semantic_map.py \
         --episode /path/to/2azQ1b91cZZ_140 \
-        --parsed /path/to/parsed_instructions.json \
-        --stride 4
+        --parsed /path/to/parsed_instructions.json
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import argparse
 import json
 import os
 import sys
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -29,20 +34,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_portal_map import _lookup, _stem, load_meta  # noqa: E402
 from extract_portals import PortalConfig, habitat_agent_matrix, load_depth  # noqa: E402
 from semantic_map import (  # noqa: E402
+    LABEL_COLORS,
     SemanticConfig,
     SemanticMap,
     _match_episode,
     mask_points,
     prompts_from_parsed,
-)
-
-PALETTE = (
-    (0, 180, 70),
-    (220, 120, 0),
-    (150, 40, 180),
-    (0, 110, 210),
-    (190, 40, 40),
-    (0, 150, 150),
+    select_keyframes,
 )
 
 
@@ -143,31 +141,75 @@ def _prompts_for(episode_dir, parsed_path, scene_id, episode_id, explicit):
     return prompts
 
 
-def process_episode(episode_dir, out_name, stride, prompts, processor, config, portal_config, save_frames):
+def zip_directory(source_dir):
+    """Overwrite <source_dir>.zip with the files currently in that folder."""
+    zip_path = source_dir + ".zip"
+    temporary = zip_path + ".tmp"
+    parent = os.path.dirname(os.path.abspath(source_dir))
+    try:
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for dirpath, _, filenames in os.walk(source_dir):
+                for name in sorted(filenames):
+                    full = os.path.join(dirpath, name)
+                    arcname = os.path.relpath(full, parent).replace(os.sep, "/")
+                    archive.write(full, arcname)
+        os.replace(temporary, zip_path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+    print(f"zip {zip_path}", flush=True)
+    return zip_path
+
+
+def process_episode(
+    episode_dir, out_name, stride, move_m, turn_deg, prompts, processor, config, portal_config, save_frames
+):
     rgb_dir = os.path.join(episode_dir, "rgb")
     depth_dir = os.path.join(episode_dir, "depth")
     out_dir = os.path.join(episode_dir, out_name)
     os.makedirs(out_dir, exist_ok=True)
     names = sorted(name for name in os.listdir(rgb_dir) if name.endswith(".jpg"))
     meta = load_meta(episode_dir, names)
-    smap = SemanticMap(config)
-    log = [f"# {os.path.basename(episode_dir)}", "prompts: " + ", ".join(prompts)]
-    kept_frames = 0
-    for name in names[::stride]:
+    smap = SemanticMap(config, portal_config)
+    poses = []
+    for name in names:
         stem = _stem(name)
         depth_path = os.path.join(depth_dir, stem + ".npy")
         entry = _lookup(meta, stem)
-        if not os.path.exists(depth_path) or entry is None:
+        pose = None
+        depth = None
+        if entry is not None:
+            pose = habitat_agent_matrix(entry["position"], entry["rotation_wxyz"])
+        if os.path.exists(depth_path):
+            depth = load_depth(depth_path, portal_config)
+        if pose is not None:
+            smap.note_frame(pose, depth)
+        poses.append(pose)
+    chosen = select_keyframes(poses, stride, move_m, turn_deg)
+    if stride is None:
+        mode = f"move>={move_m}m or turn>={turn_deg:.0f}deg"
+    else:
+        mode = f"stride={stride}"
+    print(f"keyframes {len(chosen)}/{len(names)} ({mode})", flush=True)
+    log = [
+        f"# {os.path.basename(episode_dir)}",
+        "prompts: " + ", ".join(prompts),
+        f"keyframes: {len(chosen)}/{len(names)} ({mode})",
+    ]
+    kept_frames = 0
+    for index in chosen:
+        name = names[index]
+        pose = poses[index]
+        depth_path = os.path.join(depth_dir, _stem(name) + ".npy")
+        if pose is None or not os.path.exists(depth_path):
             print(f"  skip {name}: missing depth or meta", flush=True)
             continue
-        pose = habitat_agent_matrix(entry["position"], entry["rotation_wxyz"])
         depth = load_depth(depth_path, portal_config)
-        smap.note_agent(pose)
         image = Image.open(os.path.join(rgb_dir, name)).convert("RGB")
         canvas = np.array(image)
         counts = {"new": 0, "updated": 0, "skip": 0}
-        for index, (prompt, masks, scores) in enumerate(segment_prompts(processor, image, prompts)):
-            color = PALETTE[index % len(PALETTE)]
+        for prompt_index, (prompt, masks, scores) in enumerate(segment_prompts(processor, image, prompts)):
+            color = LABEL_COLORS[prompt_index % len(LABEL_COLORS)]
             for mask_index, mask in enumerate(masks):
                 score = 1.0 if scores is None or len(scores) <= mask_index else float(scores[mask_index])
                 points = mask_points(mask, depth, config)
@@ -185,15 +227,17 @@ def process_episode(episode_dir, out_name, stride, prompts, processor, config, p
     with open(os.path.join(out_dir, "semantic_map.json"), "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
-    smap.render().save(os.path.join(out_dir, "map.jpg"))
+    smap.render(prompts).save(os.path.join(out_dir, "map.jpg"))
     log.append("")
     log.extend(smap.describe())
     with open(os.path.join(out_dir, "describe.txt"), "w", encoding="utf-8") as handle:
         handle.write("\n".join(log) + "\n")
     counts = payload["counts"]
+    zip_path = zip_directory(out_dir)
     summary = (
-        f"{os.path.basename(episode_dir)} frames={kept_frames} prompts={len(prompts)} "
-        f"instances={len(payload['instances'])} confirmed={counts['confirmed']} candidate={counts['candidate']}"
+        f"{os.path.basename(episode_dir)} sam={kept_frames}/{len(names)} prompts={len(prompts)} "
+        f"instances={len(payload['instances'])} confirmed={counts['confirmed']} candidate={counts['candidate']} "
+        f"zip={zip_path}"
     )
     print(summary, flush=True)
     return summary
@@ -208,7 +252,14 @@ def main():
     parser.add_argument("--episode-id", help="配合 --scene-id")
     parser.add_argument("--prompts", help="逗号分隔的提示词，给定后不再读解析结果")
     parser.add_argument("--out-name", default="semantic_map")
-    parser.add_argument("--stride", type=int, default=4, help="每隔多少帧跑一次 SAM3，默认 4")
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=None,
+        help="固定每隔多少帧跑一次 SAM3。不设则走 0.5 米或转 30 度再跑，首尾帧总会跑",
+    )
+    parser.add_argument("--key-move", type=float, default=0.5, help="位姿采样：相对上次分割的位移，米")
+    parser.add_argument("--key-turn", type=float, default=30.0, help="位姿采样：相对上次分割的转角，度")
     parser.add_argument("--min-score", type=float, default=0.45)
     parser.add_argument(
         "--checkpoint",
@@ -232,16 +283,28 @@ def main():
         summary_dir = args.frames
     if not episodes:
         raise SystemExit("没有找到带 rgb/、depth/ 和 meta.json 的轨迹")
+    if args.stride is not None and args.stride < 1:
+        parser.error("--stride must be >= 1")
     config = SemanticConfig(min_score=args.min_score)
     portal_config = PortalConfig()
-    print(f"loading SAM3, episodes={len(episodes)} stride={args.stride}", flush=True)
+    sampling = f"stride={args.stride}" if args.stride is not None else f"move>={args.key_move}m or turn>={args.key_turn:.0f}deg"
+    print(f"loading SAM3, episodes={len(episodes)} {sampling}", flush=True)
     processor = load_processor(args.checkpoint)
     summaries = []
     for episode in episodes:
         prompts = _prompts_for(episode, args.parsed, args.scene_id, args.episode_id, args.prompts)
         summaries.append(
             process_episode(
-                episode, args.out_name, args.stride, prompts, processor, config, portal_config, not args.no_frames
+                episode,
+                args.out_name,
+                args.stride,
+                args.key_move,
+                args.key_turn,
+                prompts,
+                processor,
+                config,
+                portal_config,
+                not args.no_frames,
             )
         )
     with open(os.path.join(summary_dir, args.out_name + "_summary.txt"), "w", encoding="utf-8") as handle:

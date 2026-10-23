@@ -14,8 +14,29 @@ import argparse
 import numpy as np
 from PIL import Image, ImageDraw
 
-from extract_portals import camera_xz_to_world, focal_px
+from extract_portals import PortalConfig, camera_xz_to_world, focal_px
 from parse_instructions import ARTICLES, ROOM_WORDS, _landmark
+from portal_map import (  # noqa: E402
+    AGENT,
+    FREE,
+    OCCUPIED,
+    TRAJECTORY,
+    UNKNOWN,
+    MapConfig,
+    OccupancyGrid,
+    _agent_axes,
+    _load_font,
+)
+
+# Prompt order, shared with the RGB overlays in build_semantic_map.py.
+LABEL_COLORS = (
+    (0, 180, 70),
+    (220, 120, 0),
+    (150, 40, 180),
+    (0, 110, 210),
+    (190, 40, 40),
+    (0, 150, 150),
+)
 
 
 class SemanticConfig:
@@ -156,16 +177,96 @@ def prompts_from_parsed(parsed):
     return found
 
 
+def pose_separated(previous, current, move_m, turn_deg):
+    """True when the agent has walked ``move_m`` or turned ``turn_deg`` since ``previous``."""
+    moved = float(np.linalg.norm(np.asarray(current)[[0, 2], 3] - np.asarray(previous)[[0, 2], 3]))
+    if moved >= move_m:
+        return True
+    earlier, later = _agent_axes(previous)[0], _agent_axes(current)[0]
+    turn = float(np.degrees(np.arccos(np.clip(float(np.dot(earlier, later)), -1.0, 1.0))))
+    return turn >= turn_deg
+
+
+def select_keyframes(poses, stride=None, move_m=0.5, turn_deg=30.0):
+    """Frame indexes to segment. ``stride`` forces a fixed step; otherwise sample by pose.
+
+    The first posed frame and the last posed frame are always included.
+    """
+    count = len(poses)
+    if count == 0:
+        return []
+    if stride is not None:
+        chosen = list(range(0, count, max(1, int(stride))))
+    else:
+        chosen = []
+        previous = None
+        for index, pose in enumerate(poses):
+            if pose is None:
+                continue
+            if previous is None or pose_separated(previous, pose, move_m, turn_deg):
+                chosen.append(index)
+                previous = pose
+    last = next((index for index in range(count - 1, -1, -1) if poses[index] is not None), None)
+    if last is not None and last not in chosen:
+        chosen.append(last)
+    return chosen
+
+
+def _smooth_path(path, window=5):
+    """Light moving average for drawing. Endpoints stay on the real poses."""
+    points = np.asarray(path, dtype=np.float64)
+    if len(points) < 3 or window < 3:
+        return points
+    if window % 2 == 0:
+        window += 1
+    pad = window // 2
+    kernel = np.ones(window) / window
+    padded = np.pad(points, ((pad, pad), (0, 0)), mode="edge")
+    smoothed = np.stack([np.convolve(padded[:, axis], kernel, mode="valid") for axis in (0, 1)], axis=1)
+    smoothed[0] = points[0]
+    smoothed[-1] = points[-1]
+    return smoothed
+
+
+def _text_box(text, font):
+    draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    if hasattr(draw, "textbbox"):
+        return draw.textbbox((0, 0), text, font=font)
+    width, height = draw.textsize(text, font=font)
+    return (0, 0, width, height)
+
+
+def _draw_centered(draw, center, text, font, fill):
+    left, top, right, bottom = _text_box(text, font)
+    width, height = right - left, bottom - top
+    draw.text((center[0] - width / 2 - left, center[1] - height / 2 - top), text, fill=fill, font=font)
+
+
 class SemanticMap:
-    def __init__(self, config=None):
+    def __init__(self, config=None, portal_config=None, map_config=None):
         self.config = config or SemanticConfig()
+        self.portal_config = portal_config or PortalConfig()
+        self.map_config = map_config or MapConfig()
         self.instances = []
         self.path = []
+        self.heading = None
+        self.grid = None
         self._next_id = 1
 
-    def note_agent(self, pose):
+    def note_frame(self, pose, depth=None):
+        """Record one pose. Depth, when present, updates the occupancy grid."""
         pose = np.asarray(pose, dtype=np.float64)
         self.path.append([float(pose[0, 3]), float(pose[2, 3])])
+        self.heading = np.asarray(_agent_axes(pose)[0], dtype=np.float64)
+        if depth is None:
+            return
+        agent_xz = pose[[0, 2], 3].copy()
+        if self.grid is None:
+            self.grid = OccupancyGrid(agent_xz, self.map_config)
+        self.grid.integrate(np.squeeze(depth).astype(np.float32), pose, self.portal_config)
+
+    def note_agent(self, pose):
+        self.note_frame(pose)
 
     def observe(self, label, points_xz, score, frame):
         """Fuse one mask. ``points_xz`` is world (x, z). Returns 'new', 'updated', or 'skip'."""
@@ -194,19 +295,34 @@ class SemanticMap:
             return "skip"
         return self.observe(label, camera_xz_to_world(points_cam_xz, pose), score, frame)
 
+    def label_indexes(self):
+        """Per-label number in first-seen order. Two doorways are 1 and 2, not a global id."""
+        counts = {}
+        indexes = {}
+        for inst in self.instances:
+            counts[inst.label] = counts.get(inst.label, 0) + 1
+            indexes[inst.id] = counts[inst.label]
+        return indexes
+
     def describe(self):
+        indexes = self.label_indexes()
         lines = []
         for inst in self.instances:
             state = "confirmed" if inst.hits >= self.config.confirm_hits else "candidate"
             lines.append(
-                f"{inst.id}: {inst.label} {state} ({inst.x:.2f}, {inst.z:.2f}) "
+                f"{indexes[inst.id]}: {inst.label} {state} ({inst.x:.2f}, {inst.z:.2f}) "
                 f"hits={inst.hits} mean_score={inst.score_sum / inst.hits:.2f} best={inst.best_frame}"
             )
         return lines
 
     def to_dict(self, prompts):
         confirm = self.config.confirm_hits
-        instances = [inst.to_dict(confirm) for inst in self.instances]
+        indexes = self.label_indexes()
+        instances = []
+        for inst in self.instances:
+            row = inst.to_dict(confirm)
+            row["index"] = indexes[inst.id]
+            instances.append(row)
         counts = {"confirmed": 0, "candidate": 0}
         for inst in instances:
             counts[inst["state"]] += 1
@@ -219,37 +335,152 @@ class SemanticMap:
             "instances": instances,
         }
 
-    def render(self, size=800):
-        points = [tuple(p) for p in self.path]
-        points += [(inst.x, inst.z) for inst in self.instances]
-        image = Image.new("RGB", (size, size), (245, 245, 245))
-        if not points:
+    def _color(self, label, prompts):
+        if label in prompts:
+            return LABEL_COLORS[list(prompts).index(label) % len(LABEL_COLORS)]
+        return (90, 90, 90)
+
+    def _view(self, size):
+        """Overview frame matching portal_map: +x right, -z up. Extent comes from known cells."""
+        bounds = self.grid.known_bounds() if self.grid is not None else None
+        if bounds is None:
+            points = [[x, z] for x, z in self.path]
+            points += [
+                [inst.x, inst.z]
+                for inst in self.instances
+                if inst.hits >= self.config.confirm_hits
+            ]
+            if not points:
+                return None
+            pts = np.asarray(points, dtype=np.float64)
+            lo, hi = pts.min(axis=0) - 1.0, pts.max(axis=0) + 1.0
+            from_grid = False
+        else:
+            lo, hi = np.asarray(bounds[0], dtype=np.float64), np.asarray(bounds[1], dtype=np.float64)
+            from_grid = True
+        center = (lo + hi) / 2.0
+        extent = float(max(hi - lo)) + 2.0
+        view_m = max(extent, 4.0)
+        return center, view_m / size, from_grid
+
+    def render(self, prompts=None, size=800):
+        """Occupancy underneath, confirmed instances as numbered dots, legend at the top left."""
+        if prompts is None:
+            prompts = []
+            for inst in self.instances:
+                if inst.label not in prompts:
+                    prompts.append(inst.label)
+        prompts = list(prompts)
+        view = self._view(size)
+        image = Image.new("RGB", (size, size), UNKNOWN)
+        if view is None:
             return image
-        xs = [p[0] for p in points]
-        zs = [p[1] for p in points]
-        pad = 1.0
-        min_x, max_x = min(xs) - pad, max(xs) + pad
-        min_z, max_z = min(zs) - pad, max(zs) + pad
-        span = max(max_x - min_x, max_z - min_z, 1.0)
-        scale = (size - 40) / span
-
-        def px(x, z):
-            return (20 + (x - min_x) * scale, size - 20 - (z - min_z) * scale)
-
+        center, meters_per_px, from_grid = view
+        right = np.array([1.0, 0.0])
+        forward = np.array([0.0, -1.0])
+        if from_grid:
+            axis = (np.arange(size) + 0.5 - size / 2.0) * meters_per_px
+            right_off, up_off = np.meshgrid(axis, -axis)
+            world = center + right_off.reshape(-1, 1) * right + up_off.reshape(-1, 1) * forward
+            codes = self.grid.codes(world).reshape(size, size)
+            canvas = np.empty((size, size, 3), dtype=np.uint8)
+            canvas[:] = UNKNOWN
+            canvas[codes == 1] = FREE
+            canvas[codes == 2] = OCCUPIED
+            image = Image.fromarray(canvas)
         draw = ImageDraw.Draw(image)
-        if len(self.path) >= 2:
-            draw.line([px(x, z) for x, z in self.path], fill=(0, 150, 255), width=2)
-        colors = ((0, 140, 70), (180, 90, 0), (140, 40, 160), (0, 90, 180), (160, 40, 40))
-        labels = []
+
+        def to_px(point):
+            delta = np.asarray(point, dtype=np.float64) - center
+            return (
+                float(delta @ right) / meters_per_px + size / 2.0,
+                size / 2.0 - float(delta @ forward) / meters_per_px,
+            )
+
+        smoothed = _smooth_path(self.path)
+        if len(smoothed) >= 2:
+            draw.line([to_px(point) for point in smoothed], fill=TRAJECTORY, width=2)
+        if self.path:
+            sx, sy = to_px(self.path[0])
+            draw.ellipse((sx - 6, sy - 6, sx + 6, sy + 6), outline=(0, 0, 0), width=2)
+        indexes = self.label_indexes()
+        number_font = _load_font(14)
+        dot = 11
         for inst in self.instances:
-            if inst.label not in labels:
-                labels.append(inst.label)
-            color = colors[labels.index(inst.label) % len(colors)]
-            cx, cy = px(inst.x, inst.z)
-            radius = max(4, inst.radius_m * scale)
-            draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), outline=color, width=3)
-            draw.text((cx + 4, cy - 6), f"{inst.id}:{inst.label}", fill=color)
-        return image
+            if inst.hits < self.config.confirm_hits:
+                continue
+            color = self._color(inst.label, prompts)
+            cx, cy = to_px((inst.x, inst.z))
+            draw.ellipse((cx - dot, cy - dot, cx + dot, cy + dot), fill=color)
+            _draw_centered(draw, (cx, cy), str(indexes[inst.id]), number_font, (255, 255, 255))
+        if self.heading is not None and self.path:
+            origin = to_px(self.path[-1])
+            tip = to_px(np.asarray(self.path[-1], dtype=np.float64) + self.heading * 0.45)
+            _draw_arrow(draw, origin, tip, AGENT)
+
+        legend = _legend_rows(self, prompts)
+        return _decorate(image, legend, meters_per_px)
+
+
+def _draw_arrow(draw, origin, tip, fill):
+    ax, ay = origin
+    tx, ty = tip
+    dx, dy = tx - ax, ty - ay
+    length = float(np.hypot(dx, dy))
+    if length < 1:
+        return
+    if length < 18:
+        dx, dy = dx / length * 18, dy / length * 18
+        tx, ty = ax + dx, ay + dy
+        length = 18.0
+    side_x, side_y = -dy / length, dx / length
+    wing = 7
+    back = 0.25
+    left = (ax + dx * back + side_x * wing, ay + dy * back + side_y * wing)
+    right = (ax + dx * back - side_x * wing, ay + dy * back - side_y * wing)
+    draw.polygon([(tx, ty), left, right], fill=fill)
+
+
+def _legend_rows(smap, prompts):
+    confirm = smap.config.confirm_hits
+    rows = []
+    for label in prompts:
+        count = sum(1 for inst in smap.instances if inst.label == label and inst.hits >= confirm)
+        rows.append((smap._color(label, prompts), f"{label}  {count}"))
+    rows.append(((0, 0, 0), "start"))
+    rows.append((AGENT, "end"))
+    return rows
+
+
+def _decorate(image, rows, meters_per_px):
+    """Legend at the top left and a 1 m scale bar. Both sit on a light plate."""
+    font = _load_font(18)
+    swatch = 14
+    gap = 8
+    line = 24
+    pad = 10
+    widths = [_text_box(text, font)[2] - _text_box(text, font)[0] for _, text in rows]
+    box_w = pad * 2 + swatch + gap + (max(widths) if widths else 0)
+    box_h = pad * 2 + line * len(rows)
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    plate = (255, 255, 255, 220)
+    if hasattr(draw, "rounded_rectangle"):
+        draw.rounded_rectangle((8, 8, 8 + box_w, 8 + box_h), radius=6, fill=plate)
+    else:
+        draw.rectangle((8, 8, 8 + box_w, 8 + box_h), fill=plate)
+    for index, (color, text) in enumerate(rows):
+        y = 8 + pad + index * line
+        draw.rectangle((8 + pad, y + 3, 8 + pad + swatch, y + 3 + swatch), fill=color + (255,))
+        draw.text((8 + pad + swatch + gap, y), text, fill=(20, 20, 20, 255), font=font)
+    bar = 1.0 / meters_per_px
+    x0, y0 = 16, image.size[1] - 28
+    label = _text_box("1 m", font)
+    label_w = label[2] - label[0]
+    draw.rectangle((x0 - 6, y0 - 22, x0 + max(bar, label_w) + 8, y0 + 10), fill=plate)
+    draw.line((x0, y0, x0 + bar, y0), fill=(0, 0, 0, 255), width=4)
+    draw.text((x0, y0 - 20), "1 m", fill=(0, 0, 0, 255), font=font)
+    return Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
 
 
 def _has_token(text, token):
@@ -312,6 +543,36 @@ def self_check():
     assert smap.instances[0].hits == 2
     assert smap.instances[0].to_dict(2)["state"] == "confirmed"
     assert smap.instances[1].to_dict(2)["state"] == "candidate"
+    payload = smap.to_dict(["doorway"])
+    assert [row["index"] for row in payload["instances"]] == [1, 2]
+    assert payload["path_xz"] == []
+
+    def pose_at(x, z, yaw):
+        cosine, sine = np.cos(yaw), np.sin(yaw)
+        pose = np.eye(4)
+        pose[0, 0], pose[0, 2] = cosine, sine
+        pose[2, 0], pose[2, 2] = -sine, cosine
+        pose[0, 3], pose[2, 3] = x, z
+        return pose
+
+    straight = [pose_at(i * 0.2, 0.0, 0.0) for i in range(6)]
+    assert select_keyframes(straight) == [0, 3, 5]
+    assert select_keyframes(straight, stride=2) == [0, 2, 4, 5]
+    turns = [pose_at(0.0, 0.0, np.deg2rad(deg)) for deg in (0, 20, 40, 60)]
+    assert select_keyframes(turns) == [0, 2, 3]
+    assert select_keyframes([None, straight[0], None]) == [1]
+    smoothed = _smooth_path([[0, 0], [1, 1], [2, 0], [3, 1]])
+    assert np.allclose(smoothed[0], [0, 0]) and np.allclose(smoothed[-1], [3, 1])
+
+    drawn = smap.render(["doorway"])
+    assert drawn.size == (800, 800)
+    assert (np.asarray(drawn) == np.array(LABEL_COLORS[0])).all(axis=-1).any()
+
+    walked = SemanticMap()
+    walked.note_frame(pose_at(0.0, 0.0, 0.0), np.full((48, 64), 2.0, np.float32))
+    walked.note_frame(pose_at(0.3, 0.0, 0.0))
+    assert len(walked.path) == 2 and walked.grid is not None and walked.heading is not None
+    assert walked.render(["doorway"]).size == (800, 800)
 
     parsed = {
         "subtasks": [
