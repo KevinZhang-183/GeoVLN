@@ -218,7 +218,13 @@ def _make_env(args, scenes):
     from habitat.config import read_write
     from habitat_baselines.config.default import get_config as get_habitat_config
 
-    import habitat_extensions.measures  # noqa: F401
+    import habitat_extensions.measures as habitat_measures
+
+    loaded = Path(habitat_measures.__file__).resolve()
+    expected = (ROOT / "streamvln" / "habitat_extensions" / "measures.py").resolve()
+    if loaded != expected:
+        raise SystemExit(f"测量扩展加载错了: {loaded}\n需要的是 {expected}")
+    print(f"habitat_extensions {loaded}", flush=True)
 
     config = get_habitat_config(str(args.config))
     with read_write(config):
