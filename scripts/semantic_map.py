@@ -78,6 +78,7 @@ class Instance:
         self.score_sum = float(score)
         self.best_score = float(score)
         self.best_frame = frame
+        self.portal_id = None
 
     def add(self, center, radius, score, frame):
         n = self.hits
@@ -91,7 +92,7 @@ class Instance:
             self.best_frame = frame
 
     def to_dict(self, confirm_hits):
-        return {
+        row = {
             "id": self.id,
             "label": self.label,
             "state": "confirmed" if self.hits >= confirm_hits else "candidate",
@@ -102,6 +103,9 @@ class Instance:
             "best_score": round(self.best_score, 3),
             "best_frame": self.best_frame,
         }
+        if self.portal_id is not None:
+            row["portal_id"] = int(self.portal_id)
+        return row
 
 
 def _erode(mask, radius):
@@ -251,14 +255,20 @@ class SemanticMap:
         self.path = []
         self.heading = None
         self.grid = None
+        self._owns_grid = True
         self._next_id = 1
 
+    def attach_grid(self, grid):
+        """Use an occupancy grid that another map updates. Depth is not integrated again."""
+        self.grid = grid
+        self._owns_grid = False
+
     def note_frame(self, pose, depth=None):
-        """Record one pose. Depth, when present, updates the occupancy grid."""
+        """Record one pose. Depth, when present, updates the occupancy grid this map owns."""
         pose = np.asarray(pose, dtype=np.float64)
         self.path.append([float(pose[0, 3]), float(pose[2, 3])])
         self.heading = np.asarray(_agent_axes(pose)[0], dtype=np.float64)
-        if depth is None:
+        if depth is None or not self._owns_grid:
             return
         agent_xz = pose[[0, 2], 3].copy()
         if self.grid is None:
@@ -289,6 +299,49 @@ class SemanticMap:
             return "new"
         best.add(center, radius, score, frame)
         return "updated"
+
+    def merge_overlapping(self):
+        """Fold same-label instances whose centers have drifted within ``assoc_dist_m``.
+
+        Returns how many instances were absorbed. The surviving id is the smaller one.
+        """
+        absorbed = 0
+        pending = True
+        while pending:
+            pending = False
+            instances = list(self.instances)
+            for index, left in enumerate(instances):
+                if left not in self.instances:
+                    continue
+                for right in instances[index + 1 :]:
+                    if right not in self.instances or left.label != right.label:
+                        continue
+                    dist = float(np.hypot(left.x - right.x, left.z - right.z))
+                    if dist > self.config.assoc_dist_m:
+                        continue
+                    self._absorb_instance(left, right)
+                    absorbed += 1
+                    pending = True
+                    break
+                if pending:
+                    break
+        return absorbed
+
+    def _absorb_instance(self, keep, drop):
+        total = keep.hits + drop.hits
+        keep.x = (keep.x * keep.hits + drop.x * drop.hits) / total
+        keep.z = (keep.z * keep.hits + drop.z * drop.hits) / total
+        keep.radius_m = (keep.radius_m * keep.hits + drop.radius_m * drop.hits) / total
+        keep.score_sum += drop.score_sum
+        if drop.best_score >= keep.best_score:
+            keep.best_score = drop.best_score
+            keep.best_frame = drop.best_frame
+        if drop.portal_id is not None and keep.portal_id is None:
+            keep.portal_id = drop.portal_id
+        keep.hits = total
+        if drop.id < keep.id:
+            keep.id = drop.id
+        self.instances.remove(drop)
 
     def observe_camera(self, label, points_cam_xz, pose, score, frame):
         if len(points_cam_xz) == 0:

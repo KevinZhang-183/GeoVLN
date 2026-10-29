@@ -760,8 +760,12 @@ class PortalMap:
             ))
         return [line for _, line in sorted(rows, key=lambda item: item[0])]
 
-    def render(self, egocentric=True, view_m=None, px=None):
-        """Top-down RGB view. Egocentric keeps the agent at the center facing up."""
+    def render(self, egocentric=True, view_m=None, px=None, overlay=None):
+        """Top-down RGB view. Egocentric keeps the agent at the center facing up.
+
+        ``overlay(draw, to_px)`` can add marks in the same pixel frame. ``to_px``
+        maps a world ``(x, z)`` point to ``(column, row)``.
+        """
         c = self.config
         px = px or c.render_px
         agent = self.pose[[0, 2], 3]
@@ -818,6 +822,8 @@ class PortalMap:
         left = (ax - hx * size * 0.5 + hy * size * 0.5, ay - hy * size * 0.5 - hx * size * 0.5)
         right_pt = (ax - hx * size * 0.5 - hy * size * 0.5, ay - hy * size * 0.5 + hx * size * 0.5)
         draw.polygon([tip, left, right_pt], fill=AGENT)
+        if overlay is not None:
+            overlay(draw, to_px)
         return image
 
     def to_dict(self):
