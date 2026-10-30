@@ -97,7 +97,6 @@ class OracleSuccess(Measure):
     #     super().__init__()
 
     def __init__(self, *args: Any, config: Any, **kwargs: Any):
-        print(f"in oracle success init: args = {args}, kwargs = {kwargs}")
         self._config = config
         super().__init__()
 

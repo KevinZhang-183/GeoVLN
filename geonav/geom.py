@@ -88,17 +88,17 @@ def frontiers(grid, agent_xz, min_m=0.5, pull_m=0.5, limit=12):
     return points[:limit]
 
 
-def plan(grid, start_xz, goal_xz, inflate_m=0.15, unknown_cost=5.0, coarse_m=0.2, snap_m=1.0):
-    """A* on a coarsened copy of the occupancy grid.
+def planner_grid(grid, inflate_m=0.15, coarse_m=0.2):
+    """The occupancy grid A* searches, after inflation and coarsening.
 
-    Occupied cells are dilated by ``inflate_m``. Unknown cells are walkable at
-    ``unknown_cost``. The result is a list of world ``(x, z)`` points, or None
-    when the start and goal cannot be connected.
+    Returns ``(labels, origin_xz, cell_m)``. ``labels`` is uint8 with 0 unknown,
+    1 free and 2 occupied. A coarse cell is occupied when any inflated fine cell
+    inside it is occupied. ``None`` when the grid is too small to coarsen.
     """
     if grid is None:
         return None
     step = max(1, int(round(coarse_m / grid.res)))
-    inflate_cells = int(math.ceil(inflate_m / grid.res))
+    inflate_cells = int(math.ceil(inflate_m / max(grid.res, 1e-6)))
     occupied = grid.logodds > grid.config.occupied_logodds
     if inflate_cells > 0:
         occupied = _dilate(occupied, inflate_cells)
@@ -112,15 +112,46 @@ def plan(grid, start_xz, goal_xz, inflate_m=0.15, unknown_cost=5.0, coarse_m=0.2
     labels = np.zeros((count, count), dtype=np.uint8)
     labels[free_c] = 1
     labels[occupied_c] = 2
+    return labels, np.asarray(grid.origin, dtype=np.float64), grid.res * step
+
+
+def planner_codes(grid, points_xz, inflate_m=0.15, coarse_m=0.2):
+    """Classify world ``(x, z)`` points on the grid A* searches."""
+    pts = np.atleast_2d(np.asarray(points_xz, dtype=np.float64))
+    out = np.zeros(len(pts), dtype=np.uint8)
+    built = planner_grid(grid, inflate_m, coarse_m)
+    if built is None or len(pts) == 0:
+        return out
+    labels, origin, cell_m = built
+    col = np.floor((pts[:, 0] - origin[0]) / cell_m).astype(np.int64)
+    row = np.floor((pts[:, 1] - origin[1]) / cell_m).astype(np.int64)
+    height, width = labels.shape
+    ok = (row >= 0) & (col >= 0) & (row < height) & (col < width)
+    out[ok] = labels[row[ok], col[ok]]
+    return out
+
+
+def plan(grid, start_xz, goal_xz, inflate_m=0.15, unknown_cost=5.0, coarse_m=0.2, snap_m=1.0):
+    """A* on a coarsened copy of the occupancy grid.
+
+    Occupied cells are dilated by ``inflate_m``. Unknown cells are walkable at
+    ``unknown_cost``. The result is a list of world ``(x, z)`` points, or None
+    when the start and goal cannot be connected.
+    """
+    built = planner_grid(grid, inflate_m, coarse_m)
+    if built is None:
+        return None
+    labels, origin, cell_m = built
+    count = labels.shape[0]
 
     def cell_of(xz):
-        col = int(math.floor((float(xz[0]) - grid.origin[0]) / grid.res / step))
-        row = int(math.floor((float(xz[1]) - grid.origin[1]) / grid.res / step))
+        col = int(math.floor((float(xz[0]) - origin[0]) / cell_m))
+        row = int(math.floor((float(xz[1]) - origin[1]) / cell_m))
         if row < 0 or col < 0 or row >= count or col >= count:
             return None
         return row, col
 
-    radius = max(1, int(math.ceil(snap_m / (grid.res * step))))
+    radius = max(1, int(math.ceil(snap_m / cell_m)))
     start = _nearest(labels, cell_of(start_xz), radius, allow_unknown=False)
     if start is None:
         start = _nearest(labels, cell_of(start_xz), radius, allow_unknown=True)
@@ -134,7 +165,7 @@ def plan(grid, start_xz, goal_xz, inflate_m=0.15, unknown_cost=5.0, coarse_m=0.2
         return None
 
     def center(row, col):
-        return grid.origin + np.array([col * step + step / 2.0, row * step + step / 2.0]) * grid.res
+        return origin + np.array([col + 0.5, row + 0.5]) * cell_m
 
     return [center(row, col) for row, col in route]
 

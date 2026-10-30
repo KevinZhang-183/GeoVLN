@@ -85,8 +85,12 @@ def run_one(env, episode, row, args, client):
     spin_done = False
     stop_reason = "max_steps"
     last_reason = None
+    start_xz = None
+    action_counts = {"move_forward": 0, "turn_left": 0, "turn_right": 0}
     while not env.episode_over and step < args.max_steps:
         pose = _pose(env.sim)
+        if start_xz is None:
+            start_xz = np.asarray(pose, dtype=np.float64)[[0, 2], 3].copy()
         rgb = _rgb(observation)
         depth = _depth_meters(observation["depth"])
         world.update(depth, pose, rgb, step, policy.prompts())
@@ -119,6 +123,7 @@ def run_one(env, episode, row, args, client):
         if decision_reason != last_reason:
             print(f"  step {step:03d} {decision_reason}", flush=True)
             last_reason = decision_reason
+        action_counts[action] = action_counts.get(action, 0) + 1
         _save_vis(vis_dir, step, rgb, world, executor, args.vis_stride, force=False)
         if env.episode_over:
             break
@@ -128,6 +133,13 @@ def run_one(env, episode, row, args, client):
         if not env.episode_over:
             env.step(actions["stop"])
             stop_reason = "max_steps"
+    end_xz = np.asarray(_pose(env.sim), dtype=np.float64)[[0, 2], 3]
+    moved = float(np.hypot(end_xz[0] - start_xz[0], end_xz[1] - start_xz[1])) if start_xz is not None else 0.0
+    print(
+        f"  moved={moved:.2f}m forward={action_counts['move_forward']} "
+        f"left={action_counts['turn_left']} right={action_counts['turn_right']}",
+        flush=True,
+    )
     metrics = _plain(env.get_metrics())
     payload = {
         "scene_id": scene,
@@ -136,6 +148,8 @@ def run_one(env, episode, row, args, client):
         "instruction": row.get("instruction") or "",
         "end_landmark": (parsed or {}).get("end_landmark"),
         "steps": step,
+        "moved_m": round(moved, 3),
+        "actions": action_counts,
         "stop_reason": stop_reason,
         "sam3_calls": world.sam3_calls,
         "sam3_failures": world.sam3_failures,
@@ -152,6 +166,14 @@ def run_one(env, episode, row, args, client):
     final = world.render(executor.path, executor.waypoint)
     if final is not None:
         final.save(out_dir / "map.jpg")
+    coarse = world.render(
+        executor.path,
+        executor.waypoint,
+        coarse=True,
+        inflate_m=executor.inflate_m,
+    )
+    if coarse is not None:
+        coarse.save(out_dir / "map_coarse.jpg")
     return payload
 
 

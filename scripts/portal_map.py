@@ -760,7 +760,7 @@ class PortalMap:
             ))
         return [line for _, line in sorted(rows, key=lambda item: item[0])]
 
-    def render(self, egocentric=True, view_m=None, px=None, overlay=None):
+    def render(self, egocentric=True, view_m=None, px=None, overlay=None, codes_of=None):
         """Top-down RGB view. Egocentric keeps the agent at the center facing up.
 
         ``overlay(draw, to_px)`` can add marks in the same pixel frame. ``to_px``
@@ -788,7 +788,8 @@ class PortalMap:
         grid = (np.arange(px) + 0.5 - px / 2.0) * scale
         right_off, up_off = np.meshgrid(grid, -grid)
         world = center + right_off.reshape(-1, 1) * right + up_off.reshape(-1, 1) * fwd
-        codes = self.grid.codes(world).reshape(px, px)
+        classify = self.grid.codes if codes_of is None else codes_of
+        codes = classify(world).reshape(px, px)
         canvas = np.empty((px, px, 3), dtype=np.uint8)
         canvas[:] = UNKNOWN
         canvas[codes == 1] = FREE

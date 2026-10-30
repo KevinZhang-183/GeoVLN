@@ -82,14 +82,16 @@ class Executor:
             if self.stuck_count >= 2:
                 self.abandoned = True
                 return None
-        route = plan(
-            grid,
-            agent,
-            target.xz,
-            inflate_m=self.inflate_m,
-            snap_m=target.snap_m,
-        )
-        self.path = route or []
+        route = self.path if _path_open(self.path, grid, agent, target) else None
+        if not route:
+            route = plan(
+                grid,
+                agent,
+                target.xz,
+                inflate_m=self.inflate_m,
+                snap_m=target.snap_m,
+            )
+            self.path = route or []
         if not route:
             self.stuck_count += 1
             if self.stuck_count >= 2:
@@ -108,6 +110,24 @@ class Executor:
             return False
         start = self._forwards[-5]
         return float(np.hypot(agent[0] - start[0], agent[1] - start[1])) < 0.1
+
+
+def _path_open(path, grid, agent, target):
+    """Keep a plan while it still reaches this target and does not cross a wall.
+
+    Replanning through unknown space every step flips between equal paths, and
+    the agent turns in place instead of walking.
+    """
+    if not path or grid is None:
+        return False
+    points = np.asarray(path, dtype=np.float64)
+    end = points[-1]
+    if float(np.hypot(end[0] - target.xz[0], end[1] - target.xz[1])) > max(target.snap_m, 1.0):
+        return False
+    nearest = np.min(np.hypot(points[:, 0] - agent[0], points[:, 1] - agent[1]))
+    if float(nearest) > 1.25:
+        return False
+    return not np.any(grid.codes(points) == 2)
 
 
 def _turn(error_deg):

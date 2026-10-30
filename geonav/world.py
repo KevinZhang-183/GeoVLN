@@ -13,7 +13,7 @@ from extract_portals import PortalConfig  # noqa: E402
 from portal_map import ACTIVE, MapConfig, PortalMap  # noqa: E402
 from semantic_map import SemanticConfig, SemanticMap, mask_points, pose_separated  # noqa: E402
 
-from geonav.geom import frontiers as find_frontiers  # noqa: E402
+from geonav.geom import frontiers as find_frontiers, planner_codes  # noqa: E402
 
 DOOR_WORDS = {"door", "doors", "doorway", "doorways", "arch", "archway"}
 
@@ -81,12 +81,22 @@ class World:
                     best, best_dist = track, dist
             instance.portal_id = None if best is None else best.id
 
-    def render(self, path=None, waypoint=None):
+    def render(self, path=None, waypoint=None, coarse=False, inflate_m=0.15, coarse_m=0.2):
         if self.portals.pose is None or self.portals.grid is None:
             return None
-        image = self.portals.render(egocentric=False, px=640, overlay=lambda draw, to_px: _overlay(
-            draw, to_px, self, path, waypoint
-        ))
+        codes_of = None
+        if coarse:
+            grid = self.portals.grid
+
+            def codes_of(points, grid=grid, inflate_m=inflate_m, coarse_m=coarse_m):
+                return planner_codes(grid, points, inflate_m, coarse_m)
+
+        image = self.portals.render(
+            egocentric=False,
+            px=640,
+            codes_of=codes_of,
+            overlay=lambda draw, to_px: _overlay(draw, to_px, self, path, waypoint),
+        )
         return image
 
     def _due(self, pose):
