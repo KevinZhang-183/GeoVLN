@@ -55,37 +55,240 @@ def block_ahead(grid, pose, near_m=0.3, far_m=0.7, width_m=0.4):
     return int(ok.sum())
 
 
-def frontiers(grid, agent_xz, min_m=0.5, pull_m=0.5, limit=12):
-    """Walkable cells touching unknown space, pulled back into known free space.
+def frontiers(
+    grid,
+    agent_xz,
+    min_m=0.5,
+    pull_m=0.5,
+    limit=4,
+    merge_m=1.5,
+    gap_m=0.15,
+    portals_xz=None,
+    portal_m=1.0,
+    inflate_m=0.15,
+    gain_m=2.0,
+):
+    """One standable point per opening between free and unknown space.
 
-    Clusters whose longer side is shorter than ``min_m`` are dropped. Each kept
-    cluster contributes one ``(x, z)`` point, nearest to the agent first.
+    Gaps of about ``gap_m`` are closed before clustering, and points closer than
+    ``merge_m`` collapse into the larger opening. Obstacle inflation only rejects
+    a point the robot cannot stand on. Openings shorter than ``min_m``, and
+    openings already covered by a portal, are dropped. The rest are ranked by
+    unknown area beyond the opening divided by the A* cost.
     """
-    if grid is None:
+    if grid is None or limit <= 0:
         return []
     occupied = grid.logodds > grid.config.occupied_logodds
     free = (grid.logodds < grid.config.free_logodds) & ~occupied
     unknown = ~free & ~occupied
-    edge = _dilate(unknown, 1) & free & ~_dilate(occupied, 1)
+    edge = _dilate(unknown, 1) & free
+    if not np.any(edge):
+        return []
     agent = np.asarray(agent_xz, dtype=np.float64)
-    points = []
-    for cells in _components(edge):
-        rows = [cell[0] for cell in cells]
-        cols = [cell[1] for cell in cells]
-        height = (max(rows) - min(rows) + 1) * grid.res
-        width = (max(cols) - min(cols) + 1) * grid.res
-        if max(height, width) < min_m:
+    radius = max(1, int(math.ceil(gap_m / max(grid.res, 1e-6) / 2.0)))
+    bridged = _dilate(edge, radius) & ~occupied
+    inflate_cells = int(math.ceil(inflate_m / max(grid.res, 1e-6)))
+    blocked = _dilate(occupied, inflate_cells) if inflate_cells else occupied
+    stand = free & ~blocked
+    portals = _as_points(portals_xz)
+
+    clusters = []
+    for cells in _components(bridged):
+        members = [cell for cell in cells if edge[cell]]
+        if not members:
             continue
-        centroid = grid.origin + np.array([np.mean(cols) + 0.5, np.mean(rows) + 0.5]) * grid.res
-        offset = agent - centroid
-        norm = float(np.linalg.norm(offset))
-        pulled = centroid if norm < 1e-6 else centroid + offset / norm * pull_m
-        snapped = _snap_free(grid, free, pulled, max_m=max(pull_m, 0.8))
-        if snapped is None:
+        boundary = _closest_xz(grid, members, agent)
+        pulled = _pull_toward(boundary, agent, pull_m)
+        clusters.append({
+            "anchor": _cells_xz(grid, members).mean(axis=0),
+            "boundary": boundary,
+            "point": _snap_free(grid, stand, pulled, max_m=max(pull_m, 0.8)),
+            "size": len(members),
+            "length": _opening_length(grid, members),
+            "dist": float(np.hypot(*(boundary - agent))),
+        })
+    clusters.sort(key=lambda item: (-item["size"], item["dist"]))
+    kept = []
+    for item in clusters:
+        host, host_gap = None, merge_m
+        for other in kept:
+            gap = _cluster_gap(item, other)
+            if gap < host_gap:
+                host, host_gap = other, gap
+        if host is None:
+            kept.append(item)
             continue
-        points.append(snapped)
-    points.sort(key=lambda point: float(np.hypot(point[0] - agent[0], point[1] - agent[1])))
-    return points[:limit]
+        host["length"] += item["length"]
+        host["size"] += item["size"]
+        if host["point"] is None and item["point"] is not None:
+            host["point"] = item["point"]
+            host["boundary"] = item["boundary"]
+
+    ranked = []
+    for item in kept:
+        if item["point"] is None or item["length"] < min_m:
+            continue
+        if _near_any(item["boundary"], portals, portal_m):
+            continue
+        area = _unknown_area(grid, unknown, item["boundary"], agent, gain_m)
+        ranked.append((np.asarray(item["point"], dtype=np.float64).copy(), area))
+    if not ranked:
+        return []
+    costs = _route_costs(grid, agent, [point for point, _ in ranked], inflate_m)
+    scored = []
+    for (point, area), cost in zip(ranked, costs):
+        reachable = cost is not None
+        travel = max(float(cost), 0.5) if reachable else float(np.hypot(*(point - agent))) + 50.0
+        scored.append((reachable, area / travel, travel, point))
+    scored.sort(key=lambda item: (not item[0], -item[1], item[2]))
+    return [point for _, _, _, point in scored[:limit]]
+
+
+def _as_points(points_xz):
+    if points_xz is None:
+        return np.zeros((0, 2))
+    points = np.asarray(points_xz, dtype=np.float64)
+    if points.size == 0:
+        return np.zeros((0, 2))
+    return np.atleast_2d(points).reshape(-1, 2)
+
+
+def _cells_xz(grid, cells):
+    arr = np.asarray(cells, dtype=np.float64)
+    return np.column_stack((
+        grid.origin[0] + (arr[:, 1] + 0.5) * grid.res,
+        grid.origin[1] + (arr[:, 0] + 0.5) * grid.res,
+    ))
+
+
+def _closest_xz(grid, cells, agent):
+    points = _cells_xz(grid, cells)
+    dist = np.hypot(points[:, 0] - agent[0], points[:, 1] - agent[1])
+    return points[int(np.argmin(dist))].copy()
+
+
+def _pull_toward(origin, toward, distance):
+    delta = np.asarray(toward, dtype=np.float64) - np.asarray(origin, dtype=np.float64)
+    norm = float(np.linalg.norm(delta))
+    if norm < 1e-6:
+        return np.asarray(origin, dtype=np.float64).copy()
+    return np.asarray(origin, dtype=np.float64) + delta / norm * min(distance, norm)
+
+
+def _cluster_gap(left, right):
+    """Distance between opening centers. Nearby doors stay apart; fragments of one do not."""
+    return float(np.hypot(*(left["anchor"] - right["anchor"])))
+
+
+def _opening_length(grid, cells):
+    total = 0.0
+    for run in _runs(cells):
+        if len(run) == 1:
+            total += grid.res
+            continue
+        pts = np.asarray(run, dtype=np.float64)
+        delta = pts - pts.mean(axis=0)
+        _, vecs = np.linalg.eigh(delta.T @ delta)
+        proj = delta @ vecs[:, 1]
+        total += float(proj.max() - proj.min() + 1.0) * grid.res
+    return total
+
+
+def _runs(cells):
+    remaining = set(cells)
+    runs = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        run = [start]
+        while stack:
+            row, col = stack.pop()
+            for d_row in (-1, 0, 1):
+                for d_col in (-1, 0, 1):
+                    nxt = (row + d_row, col + d_col)
+                    if nxt in remaining:
+                        remaining.remove(nxt)
+                        stack.append(nxt)
+                        run.append(nxt)
+        runs.append(run)
+    return runs
+
+
+def _near_any(xz, points, radius_m):
+    if len(points) == 0:
+        return False
+    dist = np.hypot(points[:, 0] - xz[0], points[:, 1] - xz[1])
+    return bool(np.any(dist < radius_m))
+
+
+def _unknown_area(grid, unknown, boundary, agent, radius_m):
+    """Unknown area within ``radius_m``, on the far side of the opening."""
+    direction = np.asarray(boundary, dtype=np.float64) - np.asarray(agent, dtype=np.float64)
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-6 or radius_m <= 0.0:
+        return 0.0
+    direction /= norm
+    reach = int(math.ceil(radius_m / grid.res))
+    col = int(math.floor((float(boundary[0]) - grid.origin[0]) / grid.res))
+    row = int(math.floor((float(boundary[1]) - grid.origin[1]) / grid.res))
+    row0 = max(0, row - reach)
+    row1 = min(unknown.shape[0], row + reach + 1)
+    col0 = max(0, col - reach)
+    col1 = min(unknown.shape[1], col + reach + 1)
+    window = unknown[row0:row1, col0:col1]
+    if not window.any():
+        return 0.0
+    rows, cols = np.nonzero(window)
+    points = np.column_stack((
+        grid.origin[0] + (cols + col0 + 0.5) * grid.res,
+        grid.origin[1] + (rows + row0 + 0.5) * grid.res,
+    ))
+    delta = points - np.asarray(boundary, dtype=np.float64)
+    dist = np.hypot(delta[:, 0], delta[:, 1])
+    ahead = delta @ direction
+    count = int(np.count_nonzero((dist <= radius_m) & (ahead > 0.0)))
+    return count * grid.res * grid.res
+
+
+def _route_costs(grid, start_xz, goals_xz, inflate_m, unknown_cost=5.0, coarse_m=0.2, snap_m=1.0):
+    """A* length of each goal on one coarsened grid. ``None`` when unreachable."""
+    goals = list(goals_xz)
+    if not goals:
+        return []
+    built = planner_grid(grid, inflate_m, coarse_m)
+    if built is None:
+        return [None] * len(goals)
+    labels, origin, cell_m = built
+    count = labels.shape[0]
+
+    def cell_of(xz):
+        col = int(math.floor((float(xz[0]) - origin[0]) / cell_m))
+        row = int(math.floor((float(xz[1]) - origin[1]) / cell_m))
+        if row < 0 or col < 0 or row >= count or col >= count:
+            return None
+        return row, col
+
+    radius = max(1, int(math.ceil(snap_m / cell_m)))
+    start = _nearest(labels, cell_of(start_xz), radius, allow_unknown=False)
+    if start is None:
+        start = _nearest(labels, cell_of(start_xz), radius, allow_unknown=True)
+    costs = []
+    for goal_xz in goals:
+        goal = _nearest(labels, cell_of(goal_xz), radius, allow_unknown=False)
+        if goal is None:
+            goal = _nearest(labels, cell_of(goal_xz), radius, allow_unknown=True)
+        if start is None or goal is None:
+            costs.append(None)
+            continue
+        route = _astar(labels, start, goal, unknown_cost)
+        if route is None:
+            costs.append(None)
+            continue
+        length = 0.0
+        for (row0, col0), (row1, col1) in zip(route, route[1:]):
+            length += math.hypot(row1 - row0, col1 - col0) * cell_m
+        costs.append(length)
+    return costs
 
 
 def planner_grid(grid, inflate_m=0.15, coarse_m=0.2):

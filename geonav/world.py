@@ -56,7 +56,17 @@ class World:
         self.new_traversals = sorted(after - before)
         self._add_nodes(pose, step)
         agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
-        self.frontiers = _associate(self.frontiers, find_frontiers(self.grid, agent), self._next_frontier_id)
+        hidden = self.portals._hidden_ids()
+        portals = [
+            track.center
+            for track in self.portals.tracks
+            if track.state in ("candidate", "confirmed", "traversed") and track.id not in hidden
+        ]
+        self.frontiers = _associate(
+            self.frontiers,
+            find_frontiers(self.grid, agent, portals_xz=portals),
+            self._next_frontier_id,
+        )
         if prompts and self._due(pose):
             self._segment(rgb, depth_m, pose, step, prompts)
 
