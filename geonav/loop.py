@@ -15,6 +15,28 @@ from geonav.policy import Policy
 from geonav.sam3_client import Sam3Client
 from geonav.video import write_vis_video
 from geonav.world import World
+from portal_map import _agent_axes  # noqa: E402
+
+LOOK_TURNS = 24
+ENTRY_LOOK_M = 0.5
+ENTRY_NUDGES = 4
+
+
+def budget_step(step, looking, charged):
+    """A whole look counts as one budget step, charged on its first turn."""
+    if looking:
+        if charged:
+            return step, True
+        return step + 1, True
+    return step + 1, False
+
+
+def entry_look_due(anchor, forward, xz, distance=ENTRY_LOOK_M):
+    """True once the agent has walked ``distance`` meters through the doorway, not back."""
+    if anchor is None or forward is None:
+        return False
+    delta = np.asarray(xz, dtype=np.float64) - np.asarray(anchor, dtype=np.float64)
+    return float(np.dot(delta, np.asarray(forward, dtype=np.float64))) >= distance
 
 
 def run_episodes(args):
@@ -44,7 +66,7 @@ def run_episodes(args):
             result = run_one(env, found[key], row, args, client)
             summary.append(result)
             print(
-                f"  steps={result['steps']} stop={result['stop_reason']} "
+                f"  steps={result['steps']} env_steps={result.get('env_steps')} stop={result['stop_reason']} "
                 f"success={result['metrics'].get('success')} spl={result['metrics'].get('spl')} "
                 f"ne={result['metrics'].get('distance_to_goal')} sam3={result['sam3_calls']}",
                 flush=True,
@@ -82,37 +104,55 @@ def run_one(env, episode, row, args, client):
     vis_dir = out_dir / "vis"
     vis_dir.mkdir(parents=True, exist_ok=True)
     step = 0
+    tick = 0
     exhausted = False
-    spin_left = 0 if args.mode == "goal" or args.no_look else 24
+    spin_left = 0 if args.mode == "goal" or args.no_look else LOOK_TURNS
+    look_charged = False
     spin_done = False
+    entry_look_at = None
+    entry_forward = None
+    entry_nudges = 0
     stop_reason = "max_steps"
     last_reason = None
     start_xz = None
     action_counts = {"move_forward": 0, "turn_left": 0, "turn_right": 0}
-    while not env.episode_over and step < args.max_steps:
+    while not env.episode_over and (step < args.max_steps or spin_left > 0):
         pose = _pose(env.sim)
+        agent_xz = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
         if start_xz is None:
-            start_xz = np.asarray(pose, dtype=np.float64)[[0, 2], 3].copy()
+            start_xz = agent_xz.copy()
         rgb = _rgb(observation)
         depth = _depth_meters(observation["depth"])
-        world.update(depth, pose, rgb, step, policy.prompts())
-        if world.new_traversals and mode != "goal" and not args.no_look and spin_left == 0:
-            spin_left = 24
+        world.update(depth, pose, rgb, tick, policy.prompts())
+        if world.new_traversals and mode != "goal" and not args.no_look:
+            entry_look_at = agent_xz.copy()
+            entry_forward = np.asarray(_agent_axes(pose)[0], dtype=np.float64).copy()
+            entry_nudges = 0
             policy.allow_look = True
+        if entry_look_at is not None and spin_left == 0 and entry_look_due(entry_look_at, entry_forward, agent_xz):
+            entry_look_at = None
+            spin_left = LOOK_TURNS
+            look_charged = False
         if spin_left == 0:
             if spin_done:
                 policy.allow_look = False
                 spin_done = False
             action, decision_reason, stop = _decide(policy, executor, world, pose, step)
-            if decision_reason == "look":
+            if decision_reason == "look" and entry_look_at is not None and entry_nudges < ENTRY_NUDGES:
+                action = "move_forward"
+                decision_reason = "enter"
+                entry_nudges += 1
+            elif decision_reason == "look":
+                entry_look_at = None
                 policy.allow_look = False
-                spin_left = 24
+                spin_left = LOOK_TURNS
+                look_charged = False
                 action = "turn_left"
             elif _made_progress(decision_reason):
                 policy.allow_look = True
             if stop:
                 stop_reason = decision_reason
-                _save_vis(vis_dir, step, rgb, world, executor, args.vis_stride, force=True)
+                _save_vis(vis_dir, tick, rgb, world, executor, args.vis_stride, force=True)
                 if not env.episode_over:
                     env.step(actions["stop"])
                 break
@@ -126,11 +166,12 @@ def run_one(env, episode, row, args, client):
             print(f"  step {step:03d} {decision_reason}", flush=True)
             last_reason = decision_reason
         action_counts[action] = action_counts.get(action, 0) + 1
-        _save_vis(vis_dir, step, rgb, world, executor, args.vis_stride, force=False)
+        _save_vis(vis_dir, tick, rgb, world, executor, args.vis_stride, force=False)
         if env.episode_over:
             break
         observation = env.step(actions[action])
-        step += 1
+        step, look_charged = budget_step(step, decision_reason == "look", look_charged)
+        tick += 1
     else:
         exhausted = True
         if not env.episode_over:
@@ -139,7 +180,7 @@ def run_one(env, episode, row, args, client):
     end_xz = np.asarray(_pose(env.sim), dtype=np.float64)[[0, 2], 3]
     moved = float(np.hypot(end_xz[0] - start_xz[0], end_xz[1] - start_xz[1])) if start_xz is not None else 0.0
     print(
-        f"  moved={moved:.2f}m forward={action_counts['move_forward']} "
+        f"  moved={moved:.2f}m steps={step} env_steps={tick} forward={action_counts['move_forward']} "
         f"left={action_counts['turn_left']} right={action_counts['turn_right']}",
         flush=True,
     )
@@ -151,6 +192,7 @@ def run_one(env, episode, row, args, client):
         "instruction": row.get("instruction") or "",
         "end_landmark": (parsed or {}).get("end_landmark"),
         "steps": step,
+        "env_steps": tick,
         "moved_m": round(moved, 3),
         "actions": action_counts,
         "stop_reason": stop_reason,
@@ -178,7 +220,7 @@ def run_one(env, episode, row, args, client):
     if coarse is not None:
         coarse.save(out_dir / "map_coarse.jpg")
     if start_xz is not None:
-        frame_step = max(step - 1, 0) if exhausted else step
+        frame_step = max(tick - 1, 0) if exhausted else tick
         _save_vis(vis_dir, frame_step, rgb, world, executor, args.vis_stride, force=True)
     video = write_vis_video(vis_dir, out_dir / "vis.mp4", fps=getattr(args, "vis_fps", 5))
     if video is not None:
@@ -264,7 +306,12 @@ def _make_env(args, scenes):
         config.habitat.dataset.scenes_dir = str(args.scenes_dir)
         config.habitat.dataset.content_scenes = scenes
         config.habitat.environment.iterator_options.shuffle = False
-        config.habitat.environment.max_episode_steps = args.max_steps
+        # Look still turns in the simulator, but those turns must not end the episode.
+        config.habitat.environment.max_episode_steps = args.max_steps * LOOK_TURNS
+        repeat = int(config.habitat.environment.iterator_options.max_scene_repeat_steps)
+        config.habitat.environment.iterator_options.max_scene_repeat_steps = max(
+            repeat, args.max_steps * LOOK_TURNS * 100
+        )
         config.habitat.simulator.habitat_sim_v0.gpu_device_id = args.gpu
     os.environ.setdefault("MAGNUM_LOG", "quiet")
     os.environ.setdefault("HABITAT_SIM_LOG", "quiet")

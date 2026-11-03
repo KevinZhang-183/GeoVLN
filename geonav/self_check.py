@@ -193,6 +193,23 @@ def _goal_waypoint():
     return point_waypoint("G", [0.0, 4.0], radius=0.3, snap_m=1.0)
 
 
+def check_look_budget():
+    from geonav.loop import ENTRY_LOOK_M, LOOK_TURNS, budget_step, entry_look_due
+
+    step, charged = 0, False
+    for _ in range(LOOK_TURNS):
+        step, charged = budget_step(step, True, charged)
+    assert step == 1 and charged
+    step, charged = budget_step(step, False, charged)
+    assert step == 2 and not charged
+    anchor = np.array([0.0, 0.0])
+    forward = np.array([1.0, 0.0])
+    assert not entry_look_due(anchor, forward, np.array([ENTRY_LOOK_M - 0.01, 0.0]))
+    assert entry_look_due(anchor, forward, np.array([ENTRY_LOOK_M, 0.0]))
+    assert not entry_look_due(anchor, forward, np.array([-ENTRY_LOOK_M - 0.1, 0.0]))
+    assert not entry_look_due(None, forward, np.array([1.0, 0.0]))
+
+
 def check_vis_video():
     import tempfile
     from pathlib import Path
@@ -224,6 +241,7 @@ def main():
     check_stuck()
     check_landmark_policy()
     check_goal_stop()
+    check_look_budget()
     check_vis_video()
     print("geonav self_check ok")
 
