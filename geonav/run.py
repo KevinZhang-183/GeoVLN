@@ -41,11 +41,23 @@ def main():
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--vis-stride", type=int, default=10)
+    parser.add_argument("--vis-fps", type=int, default=5, help="vis.mp4 的帧率，画面来自 vis 里已经按 vis-stride 抽过的帧")
+    parser.add_argument(
+        "--vis-video",
+        type=Path,
+        default=None,
+        help="把已有的 vis 帧合成 vis.mp4，不启动仿真器。可以是一条 episode 目录，或包含多条的结果目录",
+    )
     parser.add_argument("--sam3-url", default="http://127.0.0.1:8001")
     parser.add_argument("--no-sam3", action="store_true")
     parser.add_argument("--no-look", action="store_true", help="跳过开局和进房间后的环视")
     parser.add_argument("--dry-list", action="store_true", help="只打印解析文件里的 episode，不启动仿真器")
     args = parser.parse_args()
+    if args.vis_video:
+        from geonav.video import encode_saved_vis
+
+        encode_saved_vis(args.vis_video, args.vis_fps)
+        return
     if args.dry_list:
         rows = load_rows(args.parsed)
         if args.limit:

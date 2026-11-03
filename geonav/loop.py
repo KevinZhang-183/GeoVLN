@@ -13,6 +13,7 @@ from geonav.episodes import episode_key, load_rows
 from geonav.executor import Executor
 from geonav.policy import Policy
 from geonav.sam3_client import Sam3Client
+from geonav.video import write_vis_video
 from geonav.world import World
 
 
@@ -81,6 +82,7 @@ def run_one(env, episode, row, args, client):
     vis_dir = out_dir / "vis"
     vis_dir.mkdir(parents=True, exist_ok=True)
     step = 0
+    exhausted = False
     spin_left = 0 if args.mode == "goal" or args.no_look else 24
     spin_done = False
     stop_reason = "max_steps"
@@ -130,6 +132,7 @@ def run_one(env, episode, row, args, client):
         observation = env.step(actions[action])
         step += 1
     else:
+        exhausted = True
         if not env.episode_over:
             env.step(actions["stop"])
             stop_reason = "max_steps"
@@ -174,6 +177,12 @@ def run_one(env, episode, row, args, client):
     )
     if coarse is not None:
         coarse.save(out_dir / "map_coarse.jpg")
+    if start_xz is not None:
+        frame_step = max(step - 1, 0) if exhausted else step
+        _save_vis(vis_dir, frame_step, rgb, world, executor, args.vis_stride, force=True)
+    video = write_vis_video(vis_dir, out_dir / "vis.mp4", fps=getattr(args, "vis_fps", 5))
+    if video is not None:
+        print(f"  wrote {video}", flush=True)
     return payload
 
 

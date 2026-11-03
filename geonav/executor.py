@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from geonav.geom import bearing_deg, block_ahead, heading_error_deg, lookahead, plan
+from geonav.geom import INFLATE_M, bearing_deg, block_ahead, heading_error_deg, lookahead, plan
 
 FORWARD = "move_forward"
 LEFT = "turn_left"
@@ -12,7 +12,7 @@ RIGHT = "turn_right"
 
 
 class Executor:
-    def __init__(self, inflate_m=0.15, lookahead_m=0.6, turn_deg=10.0):
+    def __init__(self, inflate_m=INFLATE_M, lookahead_m=0.6, turn_deg=10.0):
         self.inflate_m = inflate_m
         self.lookahead_m = lookahead_m
         self.turn_deg = turn_deg

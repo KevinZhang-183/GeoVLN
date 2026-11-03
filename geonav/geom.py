@@ -13,6 +13,10 @@ install()
 
 from portal_map import _agent_axes, _dilate  # noqa: E402
 
+# One grid cell at 0.05 m. 0.15 m of 8-connected dilation, then 0.2 m coarsening,
+# was closing doorways on the planner map.
+INFLATE_M = 0.05
+
 
 def bearing_deg(pose, xz):
     """Signed degrees from the agent heading to a world ``(x, z)`` point. Right is positive."""
@@ -65,7 +69,7 @@ def frontiers(
     gap_m=0.15,
     portals_xz=None,
     portal_m=1.0,
-    inflate_m=0.15,
+    inflate_m=INFLATE_M,
     gain_m=2.0,
 ):
     """One standable point per opening between free and unknown space.
@@ -291,7 +295,7 @@ def _route_costs(grid, start_xz, goals_xz, inflate_m, unknown_cost=5.0, coarse_m
     return costs
 
 
-def planner_grid(grid, inflate_m=0.15, coarse_m=0.2):
+def planner_grid(grid, inflate_m=INFLATE_M, coarse_m=0.2):
     """The occupancy grid A* searches, after inflation and coarsening.
 
     Returns ``(labels, origin_xz, cell_m)``. ``labels`` is uint8 with 0 unknown,
@@ -318,7 +322,7 @@ def planner_grid(grid, inflate_m=0.15, coarse_m=0.2):
     return labels, np.asarray(grid.origin, dtype=np.float64), grid.res * step
 
 
-def planner_codes(grid, points_xz, inflate_m=0.15, coarse_m=0.2):
+def planner_codes(grid, points_xz, inflate_m=INFLATE_M, coarse_m=0.2):
     """Classify world ``(x, z)`` points on the grid A* searches."""
     pts = np.atleast_2d(np.asarray(points_xz, dtype=np.float64))
     out = np.zeros(len(pts), dtype=np.uint8)
@@ -334,7 +338,7 @@ def planner_codes(grid, points_xz, inflate_m=0.15, coarse_m=0.2):
     return out
 
 
-def plan(grid, start_xz, goal_xz, inflate_m=0.15, unknown_cost=5.0, coarse_m=0.2, snap_m=1.0):
+def plan(grid, start_xz, goal_xz, inflate_m=INFLATE_M, unknown_cost=5.0, coarse_m=0.2, snap_m=1.0):
     """A* on a coarsened copy of the occupancy grid.
 
     Occupied cells are dilated by ``inflate_m``. Unknown cells are walkable at

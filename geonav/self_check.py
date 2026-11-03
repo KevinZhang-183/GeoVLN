@@ -193,6 +193,27 @@ def _goal_waypoint():
     return point_waypoint("G", [0.0, 4.0], radius=0.3, snap_m=1.0)
 
 
+def check_vis_video():
+    import tempfile
+    from pathlib import Path
+
+    from PIL import Image
+
+    from geonav.video import encode_saved_vis
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "scene_1"
+        vis = root / "vis"
+        vis.mkdir(parents=True)
+        Image.new("RGB", (64, 48), (255, 0, 0)).save(vis / "0000.jpg")
+        Image.new("RGB", (64, 48), (0, 255, 0)).save(vis / "0010.jpg")
+        written = encode_saved_vis(root, fps=5)
+        if not written:
+            print("vis video encoder unavailable, skipped")
+            return
+        assert written[0].is_file() and written[0].stat().st_size > 0
+
+
 def main():
     check_bearing()
     check_plan()
@@ -203,6 +224,7 @@ def main():
     check_stuck()
     check_landmark_policy()
     check_goal_stop()
+    check_vis_video()
     print("geonav self_check ok")
 
 

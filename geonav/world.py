@@ -13,7 +13,7 @@ from extract_portals import PortalConfig  # noqa: E402
 from portal_map import ACTIVE, MapConfig, PortalMap  # noqa: E402
 from semantic_map import SemanticConfig, SemanticMap, mask_points, pose_separated  # noqa: E402
 
-from geonav.geom import frontiers as find_frontiers, planner_codes  # noqa: E402
+from geonav.geom import INFLATE_M, frontiers as find_frontiers, planner_codes  # noqa: E402
 
 DOOR_WORDS = {"door", "doors", "doorway", "doorways", "arch", "archway"}
 
@@ -91,7 +91,7 @@ class World:
                     best, best_dist = track, dist
             instance.portal_id = None if best is None else best.id
 
-    def render(self, path=None, waypoint=None, coarse=False, inflate_m=0.15, coarse_m=0.2):
+    def render(self, path=None, waypoint=None, coarse=False, inflate_m=INFLATE_M, coarse_m=0.2):
         if self.portals.pose is None or self.portals.grid is None:
             return None
         codes_of = None
