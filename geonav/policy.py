@@ -48,6 +48,7 @@ class Policy:
         self.banned = []
         self.tried_skip = False
         self.did_backtrack = False
+        self.crossed = set()
         self.baseline = set()
         self.start_step = 0
         self.traveled = 0.0
@@ -56,6 +57,9 @@ class Policy:
         self.ready = False
 
     def prompts(self):
+        """Phrases for SAM3. Goal follows the dataset point and does not build landmarks."""
+        if self.mode == "goal":
+            return []
         index = self.index if self.mode == "landmark" else 0
         return prompts_for(self.parsed, index)
 
@@ -98,6 +102,12 @@ class Policy:
             self.did_backtrack = False
             return Decision("waypoint", waypoint=choice, reason=choice.name)
         if self.allow_look:
+            # Walk through the doorway ahead and survey once inside.
+            door = self._explored_ahead(world, pose)
+            if door is not None:
+                self.lock = door
+                self.did_backtrack = False
+                return Decision("waypoint", waypoint=door, reason=door.name)
             return Decision("look", reason="no candidate")
         if not self.did_backtrack and len(world.nodes) >= 2:
             node = world.nodes[-2]
@@ -108,6 +118,8 @@ class Policy:
 
     def note_reached(self, waypoint):
         self.arrived_name = None if waypoint is None else waypoint.name
+        if waypoint is not None and waypoint.portal_id is not None:
+            self.crossed.add(waypoint.portal_id)
         if waypoint is not None and (waypoint.name[:1] in ("F", "N") or self.mode != "landmark"):
             self.banned.append(np.asarray(waypoint.stages[-1].xz, dtype=np.float64))
         self.lock = None
@@ -117,6 +129,7 @@ class Policy:
             return
         self.banned.append(np.asarray(waypoint.stages[-1].xz, dtype=np.float64))
         if waypoint.portal_id is not None:
+            self.crossed.add(waypoint.portal_id)
             world.portals.abandon(waypoint.portal_id)
         self.lock = None
         self.arrived_name = None
@@ -221,6 +234,27 @@ class Policy:
             return True
         return min(float(np.hypot(instance.x - item.x, instance.z - item.z)) for item in refs) <= 2.0
 
+    def _explored_ahead(self, world, pose, reach=1.2):
+        """The explored doorway in front of the agent, when nothing else is selectable."""
+        agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
+        best, best_dist = None, reach
+        for track in world.portals.tracks:
+            if track.state != "explored" or track.id in self.crossed:
+                continue
+            if self._banned(track.center):
+                continue
+            if abs(bearing_deg(pose, track.center)) > 75.0:
+                continue
+            dist = float(np.hypot(track.center[0] - agent[0], track.center[1] - agent[1]))
+            if dist < best_dist:
+                best, best_dist = track, dist
+        if best is None:
+            return None
+        waypoint = portal_waypoint(best, agent)
+        if world.grid is not None and plan(world.grid, agent, waypoint.stages[0].xz, snap_m=0.8) is None:
+            return None
+        return waypoint
+
     def _best_portal(self, world, pose, restrict, side):
         agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
         ranked = []
@@ -273,7 +307,8 @@ class Policy:
         name = self.lock.name
         if name.startswith("P"):
             track = world.portals.track(self.lock.portal_id)
-            return track is not None and track.state in ("candidate", "confirmed")
+            # Stay committed after the far side becomes visible, and finish the crossing.
+            return track is not None and track.state in ("candidate", "confirmed", "explored")
         if name.startswith("L"):
             wanted = int(name[1:])
             need = world.semantic.config.confirm_hits

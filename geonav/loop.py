@@ -39,6 +39,17 @@ def entry_look_due(anchor, forward, xz, distance=ENTRY_LOOK_M):
     return float(np.dot(delta, np.asarray(forward, dtype=np.float64))) >= distance
 
 
+def look_covers_entry(look_xz, anchor_xz, radius=0.8):
+    """True when a full turn already happened at this doorway.
+
+    The 0.5 m survey is a second lap if the agent just spun on the threshold.
+    """
+    if look_xz is None or anchor_xz is None:
+        return False
+    delta = np.asarray(look_xz, dtype=np.float64) - np.asarray(anchor_xz, dtype=np.float64)
+    return float(np.hypot(delta[0], delta[1])) <= radius
+
+
 def run_episodes(args):
     rows = load_rows(args.parsed)
     if args.limit:
@@ -112,6 +123,7 @@ def run_one(env, episode, row, args, client):
     entry_look_at = None
     entry_forward = None
     entry_nudges = 0
+    look_at = None
     stop_reason = "max_steps"
     last_reason = None
     start_xz = None
@@ -124,15 +136,23 @@ def run_one(env, episode, row, args, client):
         rgb = _rgb(observation)
         depth = _depth_meters(observation["depth"])
         world.update(depth, pose, rgb, tick, policy.prompts())
+        if spin_left > 0 and look_at is None:
+            look_at = agent_xz.copy()
         if world.new_traversals and mode != "goal" and not args.no_look:
             entry_look_at = agent_xz.copy()
             entry_forward = np.asarray(_agent_axes(pose)[0], dtype=np.float64).copy()
             entry_nudges = 0
             policy.allow_look = True
         if entry_look_at is not None and spin_left == 0 and entry_look_due(entry_look_at, entry_forward, agent_xz):
-            entry_look_at = None
-            spin_left = LOOK_TURNS
-            look_charged = False
+            # This doorway was already surveyed from the threshold.
+            if look_covers_entry(look_at, entry_look_at):
+                entry_look_at = None
+                policy.allow_look = False
+            else:
+                entry_look_at = None
+                spin_left = LOOK_TURNS
+                look_charged = False
+                look_at = agent_xz.copy()
         if spin_left == 0:
             if spin_done:
                 policy.allow_look = False
@@ -147,6 +167,7 @@ def run_one(env, episode, row, args, client):
                 policy.allow_look = False
                 spin_left = LOOK_TURNS
                 look_charged = False
+                look_at = agent_xz.copy()
                 action = "turn_left"
             elif _made_progress(decision_reason):
                 policy.allow_look = True

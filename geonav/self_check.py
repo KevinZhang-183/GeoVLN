@@ -151,7 +151,12 @@ def check_landmark_policy():
 def check_goal_stop():
     grid = make_grid()
     world = _FakeWorld(grid)
-    policy = Policy("goal", None, np.array([0.0, 0.0, 0.2]), allow_look=False)
+    parsed = {
+        "end_landmark": "chair",
+        "subtasks": [{"id": 1, "action": "go_to", "landmark": "chair", "near": "", "side": ""}],
+    }
+    policy = Policy("goal", parsed, np.array([0.0, 0.0, 0.2]), allow_look=False)
+    assert policy.prompts() == []
     decision = policy.decide(world, pose_at(0.0, 0.0, (0.0, 1.0)), 0)
     assert decision.kind == "stop"
 
@@ -168,7 +173,7 @@ class _Portals:
         self.tracks = []
 
     def track(self, track_id):
-        return None
+        return next((item for item in self.tracks if item.id == track_id), None)
 
     def abandon(self, track_id):
         return None
@@ -194,7 +199,7 @@ def _goal_waypoint():
 
 
 def check_look_budget():
-    from geonav.loop import ENTRY_LOOK_M, LOOK_TURNS, budget_step, entry_look_due
+    from geonav.loop import ENTRY_LOOK_M, LOOK_TURNS, budget_step, entry_look_due, look_covers_entry
 
     step, charged = 0, False
     for _ in range(LOOK_TURNS):
@@ -208,6 +213,79 @@ def check_look_budget():
     assert entry_look_due(anchor, forward, np.array([ENTRY_LOOK_M, 0.0]))
     assert not entry_look_due(anchor, forward, np.array([-ENTRY_LOOK_M - 0.1, 0.0]))
     assert not entry_look_due(None, forward, np.array([1.0, 0.0]))
+    assert look_covers_entry(np.array([0.2, 0.0]), anchor)
+    assert not look_covers_entry(np.array([3.0, 0.0]), anchor)
+    assert not look_covers_entry(None, anchor)
+
+
+def check_explored_door():
+    """A doorway that has become explored is still the way through."""
+    grid = make_grid()
+    world = _FakeWorld(grid)
+    door = _Track(4, [0.0, 1.0], [0.0, 1.0], "explored")
+    world.portals.tracks.append(door)
+    parsed = {
+        "end_landmark": "chair",
+        "subtasks": [{"id": 1, "action": "go_to", "landmark": "chair", "near": "", "side": ""}],
+    }
+    pose = pose_at(0.0, 0.0, (0.0, 1.0))
+    policy = Policy("landmark", parsed, None, allow_look=True)
+    decision = policy.decide(world, pose, 0)
+    assert decision.kind == "waypoint" and decision.waypoint.name == "P4", decision.reason
+
+    held = Policy("landmark", parsed, None, allow_look=True)
+    held.lock = decision.waypoint
+    held.ready = True
+    again = held.decide(world, pose, 1)
+    assert again.kind == "waypoint" and again.waypoint.name == "P4"
+
+    behind = _Track(5, [0.0, -1.0], [0.0, 1.0], "explored")
+    world.portals.tracks[:] = [behind]
+    looking = Policy("landmark", parsed, None, allow_look=True)
+    assert looking.decide(world, pose, 0).kind == "look"
+
+
+class _Track:
+    def __init__(self, track_id, center, normal, state):
+        self.id = track_id
+        self.center = np.asarray(center, dtype=np.float64)
+        self.normal = np.asarray(normal, dtype=np.float64)
+        self.state = state
+        self.traversed = False
+
+
+def check_landmark_placement():
+    from semantic_map import mask_points
+
+    config = SemanticConfig(erode_px=0, border_px=0, min_pixels=10, depth_band_m=0.5, pixel_stride=1, min_score=0.0)
+    depth = np.full((120, 160), 3.0, dtype=np.float32)
+    wall = np.zeros_like(depth, dtype=bool)
+    wall[10:110, 30:120] = True
+    assert len(mask_points(wall, depth, config)) == 0
+    chair = np.zeros_like(depth, dtype=bool)
+    chair[55:75, 70:100] = True
+    assert len(mask_points(chair, depth, config)) >= 10
+
+    grid = make_grid()
+    # Column covering x in [2.0, 2.2).
+    grid.logodds[:, 35] = grid.config.occupied_logodds + 2.0
+    semantic = SemanticMap(config)
+    semantic.attach_grid(grid)
+    pose = pose_at(0.0, 0.0, (1.0, 0.0))
+    cloud = np.array([[2.05, -0.1], [2.05, 0.0], [2.05, 0.1], [2.1, 0.0]], dtype=np.float64)
+    placed = semantic._off_obstacle(cloud, pose)
+    assert placed is not None
+    center = placed.mean(axis=0)
+    assert center[0] < 1.8
+    assert int(grid.codes(center.reshape(1, 2))[0]) != 2
+
+    semantic.instances = [
+        Instance(1, "chair", [1.7, 0.0], 0.2, 0.8, "a"),
+        Instance(2, "chair", [1.7, 1.2], 0.2, 0.8, "b"),
+        Instance(3, "table", [0.0, 3.0], 0.2, 0.8, "c"),
+    ]
+    assert semantic.merge_overlapping() == 1
+    assert sorted(item.label for item in semantic.instances) == ["chair", "table"]
 
 
 def check_vis_video():
@@ -242,6 +320,8 @@ def main():
     check_landmark_policy()
     check_goal_stop()
     check_look_budget()
+    check_explored_door()
+    check_landmark_placement()
     check_vis_video()
     print("geonav self_check ok")
 

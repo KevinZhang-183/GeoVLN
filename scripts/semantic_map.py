@@ -53,6 +53,9 @@ class SemanticConfig:
         min_score=0.45,
         assoc_dist_m=0.8,
         confirm_hits=2,
+        camera_height=1.25,
+        height_min=0.15,
+        height_max=1.6,
     ):
         self.hfov = hfov
         self.depth_min = depth_min
@@ -65,6 +68,9 @@ class SemanticConfig:
         self.min_score = min_score
         self.assoc_dist_m = assoc_dist_m
         self.confirm_hits = confirm_hits
+        self.camera_height = camera_height
+        self.height_min = height_min
+        self.height_max = height_max
 
 
 class Instance:
@@ -125,11 +131,24 @@ def _erode(mask, radius):
     return ~grown
 
 
+def _is_wall(points_xz, heights, thin_m=0.35, tall_m=1.0, long_m=1.5):
+    """A tall, wide, flat surface is a wall, not an object landmark."""
+    if len(points_xz) < 8 or float(np.max(heights) - np.min(heights)) < tall_m:
+        return False
+    centered = np.asarray(points_xz, dtype=np.float64)
+    centered = centered - centered.mean(axis=0)
+    _, axes = np.linalg.eigh(centered.T @ centered)
+    thin = centered @ axes[:, 0]
+    long = centered @ axes[:, 1]
+    return float(thin.max() - thin.min()) < thin_m and float(long.max() - long.min()) > long_m
+
+
 def mask_points(mask, depth, config):
     """Camera-ground points inside a mask, shape (N, 2), or an empty array.
 
     The mask is eroded and only pixels near the median depth are kept, so a
-    chair does not drag a tail onto the wall behind it.
+    chair does not drag a tail onto the wall behind it. Floor, ceiling, and
+    tall wall planes are dropped.
     """
     mask = np.asarray(mask, dtype=bool)
     depth = np.squeeze(depth).astype(np.float32)
@@ -155,13 +174,22 @@ def mask_points(mask, depth, config):
     ys, xs, z = ys[band], xs[band], z[band]
     if z.size < config.min_pixels:
         return np.zeros((0, 2), dtype=np.float32)
-    stride = max(1, config.pixel_stride)
-    ys, xs, z = ys[::stride], xs[::stride], z[::stride]
     width = depth.shape[1]
+    height = depth.shape[0]
     fx = focal_px(width, config.hfov)
     cx = (width - 1) / 2.0
+    cy = (height - 1) / 2.0
+    above = config.camera_height - (ys.astype(np.float64) - cy) * z / fx
+    body = (above > config.height_min) & (above < config.height_max)
+    ys, xs, z, above = ys[body], xs[body], z[body], above[body]
+    if z.size < config.min_pixels:
+        return np.zeros((0, 2), dtype=np.float32)
     x = (xs - cx) * z / fx
-    return np.stack([x, z], axis=1).astype(np.float32)
+    points = np.stack([x, z], axis=1).astype(np.float32)
+    if _is_wall(points, above):
+        return np.zeros((0, 2), dtype=np.float32)
+    stride = max(1, config.pixel_stride)
+    return points[::stride]
 
 
 def _room_only(text):
@@ -317,7 +345,7 @@ class SemanticMap:
                     if right not in self.instances or left.label != right.label:
                         continue
                     dist = float(np.hypot(left.x - right.x, left.z - right.z))
-                    if dist > self.config.assoc_dist_m:
+                    if dist > self.config.assoc_dist_m and not self._same_surface(left, right, dist):
                         continue
                     self._absorb_instance(left, right)
                     absorbed += 1
@@ -346,7 +374,67 @@ class SemanticMap:
     def observe_camera(self, label, points_cam_xz, pose, score, frame):
         if len(points_cam_xz) == 0:
             return "skip"
-        return self.observe(label, camera_xz_to_world(points_cam_xz, pose), score, frame)
+        world = self._off_obstacle(camera_xz_to_world(points_cam_xz, pose), pose)
+        if world is None:
+            return "skip"
+        return self.observe(label, world, score, frame)
+
+    def _off_obstacle(self, points_xz, pose, clearance=0.35, limit=0.8):
+        """Slide a detection toward the camera until it sits in open space.
+
+        Mask points land on the surface that reflected them, so a chair or a
+        false wall hit is stored on an occupied cell. The marker belongs in
+        the free space in front of that surface.
+        """
+        points = np.atleast_2d(np.asarray(points_xz, dtype=np.float64))
+        if self.grid is None or len(points) == 0:
+            return points
+        center = points.mean(axis=0)
+        if self._clear(center, clearance):
+            return points
+        agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
+        direction = agent - center
+        norm = float(np.linalg.norm(direction))
+        if norm < 1e-6:
+            return None
+        direction = direction / norm
+        step = max(float(self.grid.res), 0.05)
+        dist = step
+        while dist <= limit + 1e-9:
+            shifted = center + direction * dist
+            if self._clear(shifted, clearance):
+                return points + (shifted - center)
+            dist += step
+        return None
+
+    def _clear(self, point, clearance):
+        point = np.asarray(point, dtype=np.float64)
+        angles = np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False)
+        offsets = np.stack([np.cos(angles), np.sin(angles)], axis=1)
+        samples = [point]
+        if clearance > 0:
+            samples.append(point + offsets * (clearance * 0.5))
+            samples.append(point + offsets * clearance)
+        return not np.any(self.grid.codes(np.vstack(samples)) == 2)
+
+    def _same_surface(self, left, right, dist, reach=1.5):
+        """Same-label hits pressed against one obstacle are one object, not a row of dots."""
+        if self.grid is None or dist > reach:
+            return False
+        mid_x = (left.x + right.x) / 2.0
+        mid_z = (left.z + right.z) / 2.0
+        return (
+            self._near_obstacle(left.x, left.z)
+            and self._near_obstacle(right.x, right.z)
+            and self._near_obstacle(mid_x, mid_z)
+        )
+
+    def _near_obstacle(self, x, z, pad=0.45):
+        center = np.array([x, z], dtype=np.float64)
+        angles = np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False)
+        ring = np.stack([np.cos(angles), np.sin(angles)], axis=1) * pad
+        samples = np.vstack([center, center + ring])
+        return bool(np.any(self.grid.codes(samples) == 2))
 
     def label_indexes(self):
         """Per-label number in first-seen order. Two doorways are 1 and 2, not a global id."""

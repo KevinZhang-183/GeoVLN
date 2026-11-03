@@ -183,6 +183,14 @@ def _is_door(label):
     return bool(set(str(label).split()) & DOOR_WORDS)
 
 
+def _on_obstacle(world, x, z):
+    grid = world.grid
+    if grid is None:
+        return False
+    point = np.array([[x, z]], dtype=np.float64)
+    return int(grid.codes(point)[0]) == 2
+
+
 def _overlay(draw, to_px, world, path, waypoint):
     if path and len(path) > 1:
         draw.line([to_px(point) for point in path], fill=(255, 220, 0), width=2)
@@ -191,6 +199,8 @@ def _overlay(draw, to_px, world, path, waypoint):
         draw.ellipse((x - 4, y - 4, x + 4, y + 4), outline=(0, 220, 220))
         draw.text((x + 4, y - 8), f"F{frontier.id}", fill=(0, 180, 180))
     for instance in world.semantic.instances:
+        if _is_door(instance.label) or _on_obstacle(world, instance.x, instance.z):
+            continue
         x, y = to_px([instance.x, instance.z])
         radius = 5 if instance.hits >= world.semantic.config.confirm_hits else 3
         color = (0, 180, 70) if instance.hits >= world.semantic.config.confirm_hits else (160, 160, 60)
