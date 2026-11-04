@@ -41,12 +41,12 @@ def main():
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--vis-stride", type=int, default=10)
-    parser.add_argument("--vis-fps", type=int, default=5, help="vis.mp4 的帧率，画面来自 vis 里已经按 vis-stride 抽过的帧")
+    parser.add_argument("--vis-fps", type=int, default=5, help="vis_<轨迹编号>.mp4 的帧率，画面来自 vis 里已经按 vis-stride 抽过的帧")
     parser.add_argument(
         "--vis-video",
         type=Path,
         default=None,
-        help="把已有的 vis 帧合成 vis.mp4，不启动仿真器。可以是一条 episode 目录，或包含多条的结果目录",
+        help="把已有的 vis 帧合成 vis_<轨迹编号>.mp4，不启动仿真器。可以是一条 episode 目录，或包含多条的结果目录",
     )
     parser.add_argument("--sam3-url", default="http://127.0.0.1:8001")
     parser.add_argument("--no-sam3", action="store_true")

@@ -231,7 +231,7 @@ def run_one(env, episode, row, args, client):
     (out_dir / "episode.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     final = world.render(executor.path, executor.waypoint)
     if final is not None:
-        final.save(out_dir / "map.jpg")
+        final.save(out_dir / f"map_{episode_id}.jpg")
     coarse = world.render(
         executor.path,
         executor.waypoint,
@@ -239,11 +239,11 @@ def run_one(env, episode, row, args, client):
         inflate_m=executor.inflate_m,
     )
     if coarse is not None:
-        coarse.save(out_dir / "map_coarse.jpg")
+        coarse.save(out_dir / f"map_coarse_{episode_id}.jpg")
     if start_xz is not None:
         frame_step = max(tick - 1, 0) if exhausted else tick
         _save_vis(vis_dir, frame_step, rgb, world, executor, args.vis_stride, force=True)
-    video = write_vis_video(vis_dir, out_dir / "vis.mp4", fps=getattr(args, "vis_fps", 5))
+    video = write_vis_video(vis_dir, out_dir / f"vis_{episode_id}.mp4", fps=getattr(args, "vis_fps", 5))
     if video is not None:
         print(f"  wrote {video}", flush=True)
     return payload

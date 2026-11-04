@@ -8,7 +8,7 @@ from geonav._bootstrap import install
 
 install()
 
-from portal_map import MapConfig, OccupancyGrid  # noqa: E402
+from portal_map import MapConfig, OccupancyGrid, PortalConfig  # noqa: E402
 from semantic_map import Instance, SemanticConfig, SemanticMap  # noqa: E402
 
 from geonav.executor import Executor  # noqa: E402
@@ -288,6 +288,133 @@ def check_landmark_placement():
     assert sorted(item.label for item in semantic.instances) == ["chair", "table"]
 
 
+def _slab_hit(origin, direction, lo, hi):
+    """Entry and exit parameters of a ray against one axis-aligned slab."""
+    parallel = np.abs(direction) <= 1e-8
+    inv = np.divide(1.0, direction, out=np.full_like(direction, np.inf), where=~parallel)
+    t0 = (lo - origin) * inv
+    t1 = (hi - origin) * inv
+    t_near = np.minimum(t0, t1)
+    t_far = np.maximum(t0, t1)
+    inside = (origin >= lo) & (origin <= hi)
+    t_near = np.where(parallel, np.where(inside, -np.inf, np.inf), t_near)
+    t_far = np.where(parallel, np.where(inside, np.inf, -np.inf), t_far)
+    return t_near, t_far
+
+
+def _render_depth(width, height, hfov, camera_height, boxes, depth_max=10.0):
+    """Depth in meters for a level camera. ``boxes`` are (x0, x1, z0, z1, h0, h1)."""
+    from extract_portals import focal_px
+
+    fx = focal_px(width, hfov)
+    uu, vv = np.meshgrid(np.arange(width, dtype=np.float64), np.arange(height, dtype=np.float64))
+    dir_x = (uu - (width - 1) / 2.0) / fx
+    dir_h = -((vv - (height - 1) / 2.0) / fx)
+    dir_z = np.ones_like(dir_x)
+    t_hit = np.full(dir_x.shape, np.inf)
+    down = dir_h < -1e-8
+    t_floor = np.full(dir_x.shape, np.inf)
+    t_floor[down] = -camera_height / dir_h[down]
+    t_hit = np.where(t_floor > 0.05, t_floor, t_hit)
+    for x0, x1, z0, z1, h0, h1 in boxes:
+        tnx, tfx = _slab_hit(0.0, dir_x, x0, x1)
+        tnh, tfh = _slab_hit(camera_height, dir_h, h0, h1)
+        tnz, tfz = _slab_hit(0.0, dir_z, z0, z1)
+        enter = np.maximum(np.maximum(tnx, tnh), tnz)
+        exit_ = np.minimum(np.minimum(tfx, tfh), tfz)
+        take = (enter <= exit_) & (exit_ > 0.05)
+        enter = np.where(enter > 0.05, enter, 0.05)
+        closer = take & (enter < t_hit)
+        t_hit = np.where(closer, enter, t_hit)
+    depth = np.where(np.isfinite(t_hit), t_hit, depth_max).astype(np.float32)
+    return np.clip(depth, 0.0, depth_max)
+
+
+def _cell(grid, x, z):
+    rows, cols, ok = grid.cells([[x, z]])
+    assert bool(ok[0]), (x, z)
+    return int(rows[0]), int(cols[0])
+
+
+def _count_occupied(grid, x0, x1, z0, z1):
+    xs = np.arange(x0, x1, grid.res)
+    zs = np.arange(z0, z1, grid.res)
+    xx, zz = np.meshgrid(xs, zs)
+    pts = np.stack([xx.ravel(), zz.ravel()], axis=1)
+    rows, cols, ok = grid.cells(pts)
+    vals = grid.logodds[rows[ok], cols[ok]]
+    return int((vals > grid.config.occupied_logodds).sum())
+
+
+def check_occupancy_keeps_furniture():
+    """A table that leaves the image stays occupied, and the blind zone stays unknown."""
+    config = MapConfig()
+    config.size_m = 12.0
+    grid = OccupancyGrid(np.array([0.0, 2.0]), config)
+    portal = PortalConfig()
+    width, height = 160, 120
+    table = (-0.4, 0.4, 1.5, 2.0, 0.0, 0.45)
+    wall = (-2.5, 2.5, 3.9, 4.05, 0.0, 2.2)
+
+    def depth_at(camera_z):
+        boxes = [
+            (table[0], table[1], table[2] - camera_z, table[3] - camera_z, table[4], table[5]),
+            (wall[0], wall[1], wall[2] - camera_z, wall[3] - camera_z, wall[4], wall[5]),
+        ]
+        return _render_depth(width, height, portal.hfov, portal.camera_height, boxes, portal.depth_max)
+
+    far = depth_at(0.0)
+    for _ in range(4):
+        grid.integrate(far, pose_at(0.0, 0.0, (0.0, 1.0)), portal)
+    occupied = _count_occupied(grid, -0.35, 0.36, 1.55, 1.96)
+    assert occupied > 40, occupied
+
+    near_row, near_col = _cell(grid, 0.0, 0.4)
+    assert grid.logodds[near_row, near_col] == 0.0
+    side_row, side_col = _cell(grid, 0.8, 2.5)
+    assert grid.logodds[side_row, side_col] < config.free_logodds, grid.logodds[side_row, side_col]
+
+    close = depth_at(0.9)
+    assert float(close.min()) > 1.5
+    for _ in range(8):
+        grid.integrate(close, pose_at(0.0, 0.9, (0.0, 1.0)), portal)
+    assert _count_occupied(grid, -0.35, 0.36, 1.55, 1.96) == occupied
+    assert grid.logodds[near_row, near_col] == 0.0
+
+
+def check_cleanup_keeps_legs():
+    config = MapConfig()
+    config.resolution = 0.05
+    config.size_m = 4.0
+    grid = OccupancyGrid(np.zeros(2), config)
+    grid.logodds[:] = config.free_logodds - 1.0
+    grid.logodds[40, 40] = 2.0
+    grid.logodds[40, 41] = 2.0
+    grid._hit_frames[40, 40] = 3
+    grid._hit_frames[40, 41] = 3
+    grid.logodds[40, 50] = 2.0
+    grid._hit_frames[40, 50] = 4
+    grid.logodds[40, 60] = 2.0
+    grid._hit_frames[40, 60] = 1
+    grid.logodds[50:52, 50:52] = 2.0
+    grid._hit_frames[50:52, 50:52] = 3
+    # Unknown pocket. The confirmed block is larger than 2x2 and does not
+    # touch free space; the single-frame block should still be removed.
+    grid.logodds[55:80, 55:80] = 0.0
+    grid.logodds[72:76, 72:76] = 2.0
+    grid._hit_frames[72:76, 72:76] = 4
+    grid.logodds[60:64, 60:68] = 2.0
+    grid._hit_frames[60:64, 60:68] = 1
+    grid._cleanup()
+    assert grid.logodds[40, 40] > config.occupied_logodds
+    assert grid.logodds[40, 41] > config.occupied_logodds
+    assert grid.logodds[40, 50] > config.occupied_logodds
+    assert grid.logodds[40, 60] <= 0.0
+    assert np.all(grid.logodds[50:52, 50:52] > config.occupied_logodds)
+    assert np.all(grid.logodds[72:76, 72:76] > config.occupied_logodds)
+    assert np.all(grid.logodds[60:64, 60:68] == 0.0)
+
+
 def check_vis_video():
     import tempfile
     from pathlib import Path
@@ -306,6 +433,7 @@ def check_vis_video():
         if not written:
             print("vis video encoder unavailable, skipped")
             return
+        assert written[0].name == "vis_1.mp4"
         assert written[0].is_file() and written[0].stat().st_size > 0
 
 
@@ -322,6 +450,8 @@ def main():
     check_look_budget()
     check_explored_door()
     check_landmark_placement()
+    check_occupancy_keeps_furniture()
+    check_cleanup_keeps_legs()
     check_vis_video()
     print("geonav self_check ok")
 

@@ -36,7 +36,8 @@ def encode_saved_vis(path, fps=5):
         return []
     written = []
     for episode in episodes:
-        out = write_vis_video(episode / "vis", episode / "vis.mp4", fps)
+        episode_id = _trajectory_id(episode)
+        out = write_vis_video(episode / "vis", episode / f"vis_{episode_id}.mp4", fps)
         if out is not None:
             written.append(out)
             print(f"wrote {out}", flush=True)
@@ -57,6 +58,12 @@ def _episode_dirs(path):
             if vis.is_dir() and _frame_paths(vis):
                 found.append(vis.parent)
     return found
+
+
+def _trajectory_id(episode_dir):
+    """Episode folders are ``{scene}_{episode_id}``."""
+    name = Path(episode_dir).name
+    return name.rsplit("_", 1)[-1] if "_" in name else name
 
 
 def _frame_paths(vis_dir):
