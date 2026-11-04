@@ -217,6 +217,53 @@ def _neighbor_count(mask):
     return count
 
 
+def _view_free_indices(grid, pose, slope, end, obstacle_idx):
+    """Cells on the ground the camera can see, as flat log-odds indices.
+
+    The wedge starts at the camera and ends at the first surface in each
+    column, so a room that is only looked at becomes explored. An occupied
+    cell, including an obstacle found in this frame, cuts the wedge off.
+    """
+    slope = np.asarray(slope, dtype=np.float64)
+    end = np.clip(np.asarray(end, dtype=np.float64), 0.0, None)
+    empty = np.zeros(0, dtype=np.int64)
+    if slope.size == 0 or not np.any(end > grid.res):
+        return empty
+    step = max(grid.res * 0.5, 1e-3)
+    t = np.arange(step, float(end.max()) + step, step)
+    forward = t[:, None]
+    visible = forward < end[None, :]
+    ray_x = forward * slope[None, :]
+    pts = np.stack([ray_x.ravel(), np.broadcast_to(forward, ray_x.shape).ravel()], axis=1)
+    world = camera_xz_to_world(pts, pose)
+    rows, cols, ok = grid.cells(world)
+    n = grid.logodds.shape[0]
+    blocked_flat = (grid.logodds > grid.config.occupied_logodds).reshape(-1).copy()
+    if len(obstacle_idx):
+        blocked_flat[np.asarray(obstacle_idx, dtype=np.int64)] = True
+    blocked = np.zeros(pts.shape[0], dtype=bool)
+    on_grid = np.flatnonzero(ok)
+    blocked[on_grid] = blocked_flat[rows[ok] * n + cols[ok]]
+    blocked = blocked.reshape(ray_x.shape) & visible
+    clear = visible & ~np.maximum.accumulate(blocked, axis=0)
+    has = clear.any(axis=0)
+    last = np.argmax(np.where(clear, forward, -1.0), axis=0)
+    reach = np.where(has, t[last], 0.0)
+    agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
+    tips = camera_xz_to_world(np.stack([slope * reach, reach], axis=1), pose)
+    poly = np.vstack([agent, tips])
+    px = (poly[:, 0] - grid.origin[0]) / grid.res
+    py = (poly[:, 1] - grid.origin[1]) / grid.res
+    canvas = Image.new("L", (n, n), 0)
+    ImageDraw.Draw(canvas).polygon(list(zip(px.tolist(), py.tolist())), fill=1)
+    ys, xs = np.nonzero(np.asarray(canvas, dtype=bool))
+    if ys.size == 0:
+        return empty
+    flat = ys * n + xs
+    keep = ~blocked_flat[flat]
+    return np.unique(flat[keep])
+
+
 def _agent_axes(pose):
     """World (x, z) of the agent's forward and right directions."""
     pose = np.asarray(pose, dtype=np.float64)
@@ -270,12 +317,12 @@ class OccupancyGrid:
     def integrate(self, depth, pose, portal_config):
         """Ray-cast one depth frame.
 
-        Free space starts at the nearest ground pixel of each column, never at
-        the robot. A closer table that has dropped below the image used to be
-        erased by a ray running from the feet to the wall behind it. Every body
-        point between the obstacle heights is a hit. The log-odds rise only when
-        that cell was already hit on an earlier frame, so one noisy return does
-        not become an obstacle.
+        Explored ground is the camera wedge: from the robot out to the first
+        surface in each column, not the strip of cells the robot has walked.
+        The wedge stops at an occupied cell, so a table that has left the image
+        stays occupied and the space behind it stays unseen. Obstacle hits are
+        every body point in the height band, and the log-odds rise only when
+        that cell repeats across frames.
         """
         c, pc = self.config, portal_config
         height, width = depth.shape
@@ -291,33 +338,22 @@ class OccupancyGrid:
         # Drop the top band (ceiling, pitched roof). Keep the lower image so nearby obstacles stay.
         body_rows = vs >= int(height * pc.body_top)
         obstacle = hit & body_rows & (h > c.obstacle_min_h) & (h < c.obstacle_max_h)
-        floor = hit & (h <= c.obstacle_min_h) & (h >= -0.05)
 
         usable = obstacle & (z <= c.free_cap_m + self.res)
         near_pts = np.stack([x[usable], z[usable]], axis=1) if usable.any() else np.zeros((0, 2), dtype=np.float64)
 
-        floor_near = np.min(np.where(floor, z, np.inf), axis=0)
-        floor_far = np.max(np.where(floor, z, 0.0), axis=0)
         obs_near = np.min(np.where(obstacle, z, np.inf), axis=0)
+        far = np.max(np.where(hit, z, 0.0), axis=0)
+        has_hit = hit.any(axis=0)
         open_ray = (valid & ~hit).any(axis=0)
-        end = np.where(
-            np.isfinite(obs_near),
-            obs_near - self.res,
-            np.where(open_ray, c.free_cap_m, floor_far),
-        )
-        end = np.clip(end, 0.0, c.free_cap_m)
-        # No ground in this column: leave the near cells alone.
-        start = np.where(np.isfinite(floor_near), floor_near, np.inf)
-
-        t = np.arange(0.0, c.free_cap_m, self.res)
+        far = np.where(has_hit, far, np.where(open_ray, c.free_cap_m, 0.0))
+        has_obs = np.isfinite(obs_near)
+        end = np.where(has_obs, obs_near - self.res, far)
+        end = np.where(has_hit | open_ray | has_obs, np.clip(end, 0.0, c.free_cap_m), 0.0)
         slope = (us[0] - cx) / fx
-        inside = (t[:, None] >= start[None, :]) & (t[:, None] < end[None, :])
-        ray_z = np.broadcast_to(t[:, None], inside.shape)[inside]
-        ray_x = (t[:, None] * slope[None, :])[inside]
 
         occ = self._flat(camera_xz_to_world(near_pts, pose)) if len(near_pts) else np.zeros(0, dtype=np.int64)
-        free = self._flat(camera_xz_to_world(np.stack([ray_x, ray_z], axis=1), pose)) \
-            if ray_z.size else np.zeros(0, dtype=np.int64)
+        free = _view_free_indices(self, pose, slope, end, occ)
         free = np.setdiff1d(free, occ, assume_unique=True)
 
         r = c.agent_radius_m

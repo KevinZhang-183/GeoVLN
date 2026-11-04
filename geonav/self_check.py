@@ -347,7 +347,7 @@ def _count_occupied(grid, x0, x1, z0, z1):
 
 
 def check_occupancy_keeps_furniture():
-    """A table that leaves the image stays occupied, and the blind zone stays unknown."""
+    """Looking at a room marks that wedge explored, and a table stays occupied."""
     config = MapConfig()
     config.size_m = 12.0
     grid = OccupancyGrid(np.array([0.0, 2.0]), config)
@@ -368,18 +368,23 @@ def check_occupancy_keeps_furniture():
         grid.integrate(far, pose_at(0.0, 0.0, (0.0, 1.0)), portal)
     occupied = _count_occupied(grid, -0.35, 0.36, 1.55, 1.96)
     assert occupied > 40, occupied
+    assert int((grid.logodds < config.free_logodds).sum()) > 400
 
-    near_row, near_col = _cell(grid, 0.0, 0.4)
-    assert grid.logodds[near_row, near_col] == 0.0
-    side_row, side_col = _cell(grid, 0.8, 2.5)
-    assert grid.logodds[side_row, side_col] < config.free_logodds, grid.logodds[side_row, side_col]
+    def value(x, z):
+        row, col = _cell(grid, x, z)
+        return float(grid.logodds[row, col])
+
+    assert value(0.0, 0.4) < config.free_logodds
+    assert value(0.8, 2.5) < config.free_logodds
+    assert value(0.0, -1.5) == 0.0
+    assert value(0.0, 2.8) >= config.free_logodds
 
     close = depth_at(0.9)
     assert float(close.min()) > 1.5
     for _ in range(8):
         grid.integrate(close, pose_at(0.0, 0.9, (0.0, 1.0)), portal)
     assert _count_occupied(grid, -0.35, 0.36, 1.55, 1.96) == occupied
-    assert grid.logodds[near_row, near_col] == 0.0
+    assert value(0.0, 2.8) >= config.free_logodds
 
 
 def check_cleanup_keeps_legs():
