@@ -70,6 +70,7 @@ class MapConfig:
     partial_max_m: float = 2.5
     max_portal_m: float = 2.5
     jamb_reach_m: float = 0.30
+    jamb_align_deg: float = 40.0
     side_offset_m: float = 0.40
     narrow_reach_m: float = 1.0
     narrow_slack_m: float = 0.15
@@ -167,6 +168,12 @@ def _same_opening(a0, a1, b0, b1, sep_m, end_m, min_overlap):
     if overlap < min_overlap and ends > end_m:
         return False
     return True
+
+
+def _rotate(v, deg):
+    rad = math.radians(deg)
+    c, s = math.cos(rad), math.sin(rad)
+    return np.array([c * v[0] - s * v[1], s * v[0] + c * v[1]], dtype=np.float64)
 
 
 def _share(codes, value):
@@ -789,13 +796,22 @@ class PortalMap:
                 tr.traversed = False
 
     def _reject_reason(self, tr):
-        """Empty when the opening may stay a portal. Otherwise ``wide``, ``jamb``, ``side``, or ``narrow``."""
+        """Empty when the opening may stay a portal.
+
+        Otherwise ``wide``, ``oblique``, ``jamb``, ``side``, or ``narrow``.
+        A side view is straightened onto the jamb-to-jamb line before the other
+        checks, so the normal points through the doorway. A line that does not
+        meet both obstacles head-on is dropped.
+        """
         if tr.abandoned:
             return ""
-        if tr.width > self.config.max_portal_m:
-            return "wide"
         if self.grid is None or self.pose is None:
             return "jamb"
+        aligned = self._align_to_jambs(tr)
+        if tr.width > self.config.max_portal_m or aligned == "wide":
+            return "wide"
+        if aligned != "ok":
+            return aligned
         if not self._jambs_touch(tr):
             return "jamb"
         if not self._sides_open(tr):
@@ -803,6 +819,108 @@ class PortalMap:
         if not self._is_narrowest(tr):
             return "narrow"
         return ""
+
+    def _align_to_jambs(self, tr):
+        """Turn the segment so it meets both obstacles nearly head-on.
+
+        A side view drops the endpoints on the jamb corners, so the drawn line
+        is diagonal and its normal misses the room. Search from the center for
+        the direction that strikes both obstacles most squarely, and keep that
+        span. If no such span exists, the line is oblique and is not a door.
+        """
+        if not self._jambs_touch(tr):
+            return "jamb"
+        span = self._best_head_on_span(tr)
+        if span is None:
+            return "oblique"
+        new_a, new_b = span
+        if float(np.linalg.norm(new_b - new_a)) > self.config.max_portal_m:
+            return "wide"
+        normal = _unit(_perp(new_b - new_a))
+        if float(np.dot(normal, tr.normal)) < 0.0:
+            normal = -normal
+        tr.a = new_a
+        tr.b = new_b
+        tr.normal = normal
+        return "ok"
+
+    def _best_head_on_span(self, tr):
+        """Endpoints of the shortest gap through the center that hits both walls head-on."""
+        center = tr.center
+        if self._code_at(center) != 1:
+            return None
+        base = _unit(tr.b - tr.a)
+        if float(np.linalg.norm(base)) < 1e-9:
+            return None
+        limit = math.cos(math.radians(self.config.jamb_align_deg))
+        inset = max(self.grid.res, 1e-3)
+        best = None
+        for deg in range(-80, 81, 5):
+            direction = _rotate(base, deg)
+            pos = self._wall_hit(center, direction)
+            neg = self._wall_hit(center, -direction)
+            if pos is None or neg is None:
+                continue
+            dist_pos, out_pos = pos
+            dist_neg, out_neg = neg
+            width = dist_pos + dist_neg
+            if width > self.config.max_portal_m or width < self.config.min_segment_m:
+                continue
+            if dist_pos <= inset or dist_neg <= inset:
+                continue
+            onto_pos = float(np.dot(out_pos, -direction))
+            onto_neg = float(np.dot(out_neg, direction))
+            if onto_pos < limit or onto_neg < limit:
+                continue
+            score = min(onto_pos, onto_neg)
+            if best is not None and (score < best[0] - 1e-6 or (abs(score - best[0]) <= 1e-6 and width >= best[1])):
+                continue
+            new_a = center - direction * (dist_neg - inset)
+            new_b = center + direction * (dist_pos - inset)
+            if self._code_at((new_a + new_b) / 2.0) == 2:
+                continue
+            best = (score, width, new_a, new_b)
+        if best is None:
+            return None
+        return best[2], best[3]
+
+    def _wall_hit(self, origin, direction):
+        """Distance to a solid obstacle and the direction back out of that obstacle."""
+        dist = self._gap_ray(origin, direction)
+        if dist is None:
+            return None
+        point = origin + direction * dist
+        if not self._solid_obstacle(point):
+            return None
+        outward, _contact = self._jamb_outward(point)
+        if outward is None:
+            return None
+        return dist, outward
+
+    def _jamb_outward(self, endpoint):
+        """Unit direction from the nearby obstacle mass toward ``endpoint``, and the nearest occupied point."""
+        pts = self._occupied_points(endpoint, self.config.jamb_reach_m)
+        if len(pts) == 0:
+            return None, None
+        endpoint = np.asarray(endpoint, dtype=np.float64)
+        nearest = pts[np.argmin(np.linalg.norm(pts - endpoint, axis=1))]
+        outward = endpoint - pts.mean(axis=0)
+        if float(np.linalg.norm(outward)) < 1e-6:
+            return None, None
+        return _unit(outward), nearest
+
+    def _occupied_points(self, center, radius):
+        center = np.asarray(center, dtype=np.float64)
+        res = self.grid.res
+        span = int(math.ceil(radius / max(res, 1e-6)))
+        offsets = np.arange(-span, span + 1) * res
+        gx, gz = np.meshgrid(offsets, offsets)
+        delta = np.stack([gx.ravel(), gz.ravel()], axis=1)
+        delta = delta[np.linalg.norm(delta, axis=1) <= radius + 1e-6]
+        if len(delta) == 0:
+            return np.zeros((0, 2))
+        pts = delta + center
+        return pts[self.grid.codes(pts) == 2]
 
     def _jambs_touch(self, tr):
         reach = self.config.jamb_reach_m

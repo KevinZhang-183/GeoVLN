@@ -506,6 +506,21 @@ def check_portal_geometry():
     assert hall.reject == "narrow", hall.reject
     assert hall.state == "invalid"
 
+    slanted_map = _door_map()
+    slanted = _opening(6, [-0.45, -0.15], [0.45, 0.18], normal=(-0.35, 0.94))
+    slanted_map.tracks = [slanted]
+    slanted_map._refresh_states()
+    assert slanted.reject == "", slanted.reject
+    assert abs(slanted.a[1] - slanted.b[1]) < 0.12
+    assert abs(float(slanted.normal[1])) > 0.9
+
+    graze_map = _door_map()
+    graze = _opening(7, [-1.55, -1.6], [-1.55, -0.9])
+    graze_map.tracks = [graze]
+    graze_map._refresh_states()
+    assert graze.reject == "oblique", graze.reject
+    assert graze.state == "invalid"
+
 
 def check_vis_video():
     import tempfile
