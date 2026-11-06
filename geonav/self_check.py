@@ -8,7 +8,7 @@ from geonav._bootstrap import install
 
 install()
 
-from portal_map import MapConfig, OccupancyGrid, PortalConfig  # noqa: E402
+from portal_map import MapConfig, OccupancyGrid, PortalConfig, PortalMap, PortalTrack  # noqa: E402
 from semantic_map import Instance, SemanticConfig, SemanticMap  # noqa: E402
 
 from geonav.executor import Executor  # noqa: E402
@@ -420,6 +420,93 @@ def check_cleanup_keeps_legs():
     assert np.all(grid.logodds[60:64, 60:68] == 0.0)
 
 
+def _opening(track_id, a, b, normal=(0.0, 1.0)):
+    return PortalTrack(
+        id=track_id,
+        a=np.asarray(a, dtype=np.float64),
+        b=np.asarray(b, dtype=np.float64),
+        normal=np.asarray(normal, dtype=np.float64),
+        full=True,
+        weight=1.0,
+        first_step=0,
+        last_step=0,
+    )
+
+
+def _fill(grid, x0, z0, x1, z1, kind):
+    xs = np.arange(x0, x1, grid.res)
+    zs = np.arange(z0, z1, grid.res)
+    xx, zz = np.meshgrid(xs, zs)
+    pts = np.stack([xx.ravel(), zz.ravel()], axis=1)
+    rows, cols, ok = grid.cells(pts)
+    value = grid.config.occupied_logodds + 2.0 if kind == "occ" else grid.config.free_logodds - 1.0
+    grid.logodds[rows[ok], cols[ok]] = value
+
+
+def _door_map():
+    """A doorway at z=0. The near room (negative z) is wider; the far side stays unknown."""
+    config = MapConfig()
+    config.resolution = 0.05
+    config.size_m = 12.0
+    grid = OccupancyGrid(np.zeros(2), config)
+    _fill(grid, -1.7, -2.2, 1.7, -0.25, "free")
+    _fill(grid, -0.48, -0.25, 0.48, 0.25, "free")
+    _fill(grid, -2.05, -2.2, -1.7, -0.25, "occ")
+    _fill(grid, 1.7, -2.2, 2.05, -0.25, "occ")
+    _fill(grid, -0.85, -0.20, -0.50, 0.20, "occ")
+    _fill(grid, 0.50, -0.20, 0.85, 0.20, "occ")
+    portal_map = PortalMap(config)
+    portal_map.grid = grid
+    portal_map.pose = pose_at(0.0, -1.5, (0.0, 1.0))
+    return portal_map
+
+
+def check_portal_geometry():
+    assert PortalConfig().max_width_m == 2.5
+    assert PortalConfig().edge_max_width_m == 2.5
+    portal_map = _door_map()
+    door = _opening(1, [-0.45, 0.0], [0.45, 0.0])
+    portal_map.tracks = [door]
+    portal_map._refresh_states()
+    assert door.reject == "", door.reject
+    assert door.state == "candidate"
+
+    portal_map._check_traversal(np.array([0.0, -1.0]), np.array([0.0, 1.0]))
+    portal_map._refresh_states()
+    assert door.traversed and door.state == "traversed"
+
+    floating = _opening(2, [-0.4, -1.2], [0.4, -1.2])
+    portal_map.tracks.append(floating)
+    portal_map._refresh_states()
+    assert floating.reject == "jamb"
+    assert floating.state == "invalid"
+
+    blocked = _opening(3, [-0.45, 0.0], [0.45, 0.0])
+    _fill(portal_map.grid, -0.3, 0.25, 0.3, 0.7, "occ")
+    portal_map.tracks.append(blocked)
+    portal_map._refresh_states()
+    assert blocked.reject == "side", blocked.reject
+
+    wide = _opening(4, [-1.4, -1.2], [1.4, -1.2])
+    portal_map.tracks.append(wide)
+    portal_map._check_traversal(np.array([0.0, -1.5]), np.array([0.0, -0.8]))
+    portal_map._refresh_states()
+    assert wide.reject == "wide"
+    assert not wide.traversed and wide.state == "invalid"
+
+    corridor = PortalMap(portal_map.config)
+    corridor.grid = OccupancyGrid(np.zeros(2), portal_map.config)
+    _fill(corridor.grid, -0.45, -2.0, 0.45, 2.0, "free")
+    _fill(corridor.grid, -0.75, -2.0, -0.45, 2.0, "occ")
+    _fill(corridor.grid, 0.45, -2.0, 0.75, 2.0, "occ")
+    corridor.pose = pose_at(0.0, -1.2, (0.0, 1.0))
+    hall = _opening(5, [-0.40, 0.0], [0.40, 0.0])
+    corridor.tracks = [hall]
+    corridor._refresh_states()
+    assert hall.reject == "narrow", hall.reject
+    assert hall.state == "invalid"
+
+
 def check_vis_video():
     import tempfile
     from pathlib import Path
@@ -457,6 +544,7 @@ def main():
     check_landmark_placement()
     check_occupancy_keeps_furniture()
     check_cleanup_keeps_legs()
+    check_portal_geometry()
     check_vis_video()
     print("geonav self_check ok")
 

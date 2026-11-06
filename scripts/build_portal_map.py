@@ -108,10 +108,12 @@ def process_episode(episode_dir, out_name, stride, map_config, portal_config, sa
             frame.save(os.path.join(out_dir, name))
 
     states = Counter(tr.state for tr in pmap.tracks)
+    rejects = Counter(tr.reject for tr in pmap.tracks if tr.reject)
     hits = [tr.hits for tr in pmap.tracks]
     summary = (
         f"{os.path.basename(episode_dir)} frames={pmap.step + 1} tracks={len(pmap.tracks)} "
         + " ".join(f"{k}={v}" for k, v in sorted(states.items()))
+        + (" " + " ".join(f"{k}={v}" for k, v in sorted(rejects.items())) if rejects else "")
         + (f" mean_hits={np.mean(hits):.1f}" if hits else "")
     )
     with open(os.path.join(out_dir, "describe.txt"), "w", encoding="utf-8") as handle:

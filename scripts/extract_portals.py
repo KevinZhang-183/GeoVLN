@@ -30,8 +30,8 @@ class PortalConfig:
     depth_max: float = 10.0
     near_jamb_m: float = 1.2
     min_width_m: float = 0.40
-    max_width_m: float = 3.15
-    edge_max_width_m: float = 2.45
+    max_width_m: float = 2.5
+    edge_max_width_m: float = 2.5
     squat_min_width_m: float = 1.5
     min_aspect: float = 1.25
     rise_m: float = 1.35

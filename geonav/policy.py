@@ -332,7 +332,12 @@ class Policy:
         landmark = current.get("landmark") or ""
         room = action == "exit" or (action == "go_to" and _place_only(landmark))
         if room or (action == "go_to" and _is_door(landmark)):
-            if any(track.traversed and track.id not in self.baseline for track in world.portals.tracks):
+            # A span wider than a door is not a crossing, even if the path walked over it.
+            crossed = [
+                track for track in world.portals.tracks
+                if track.traversed and track.id not in self.baseline and getattr(track, "reject", "") != "wide"
+            ]
+            if crossed:
                 return True
             return bool(self.arrived_name and self.arrived_name.startswith("P"))
         if action in ("go_to", "stop") and self.arrived_name and self.arrived_name.startswith("L"):

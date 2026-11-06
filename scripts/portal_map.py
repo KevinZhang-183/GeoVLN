@@ -67,7 +67,13 @@ class MapConfig:
     merge_dist_m: float = 0.70
     merge_endpoint_m: float = 0.35
     merge_overlap_m: float = 0.15
-    partial_max_m: float = 2.0
+    partial_max_m: float = 2.5
+    max_portal_m: float = 2.5
+    jamb_reach_m: float = 0.30
+    side_offset_m: float = 0.40
+    narrow_reach_m: float = 1.0
+    narrow_slack_m: float = 0.15
+    gap_search_m: float = 2.5
     width_ratio: float = 1.6
     min_segment_m: float = 0.1
     confirm_hits: int = 2
@@ -161,6 +167,13 @@ def _same_opening(a0, a1, b0, b1, sep_m, end_m, min_overlap):
     if overlap < min_overlap and ends > end_m:
         return False
     return True
+
+
+def _share(codes, value):
+    codes = np.asarray(codes)
+    if codes.size == 0:
+        return 0.0
+    return float((codes == value).mean())
 
 
 def _dilate(mask, radius=1):
@@ -441,6 +454,7 @@ class PortalTrack:
     abandoned: bool = False
     state: str = "candidate"
     best: dict = None
+    reject: str = ""
 
     @property
     def center(self):
@@ -468,6 +482,7 @@ class PortalTrack:
             "explored": self.explored,
             "blocked": self.blocked,
             "abandoned": self.abandoned,
+            "reject": self.reject,
             "best": self.best,
         }
 
@@ -545,11 +560,12 @@ class PortalMap:
         labels = [(portal, self._resolve(track_id)) for portal, track_id in labels]
         seen = {self._resolve(track_id) for track_id in seen}
         self._count_misses(depth, pose, seen)
+        self.pose = pose
+        self.step = step
+        self._mark_geometry()
         if self.trajectory:
             self._check_traversal(self.trajectory[-1], agent_xz)
         self.trajectory.append(agent_xz)
-        self.pose = pose
-        self.step = step
         self._refresh_states()
         return labels
 
@@ -751,16 +767,144 @@ class PortalMap:
             tr.misses += 1
 
     def _check_traversal(self, prev_xz, cur_xz):
+        """A rejected opening is not a door, so crossing it does not count."""
         pad = self.config.traverse_pad_m
         for tr in self.tracks:
-            if tr.traversed:
+            if tr.traversed or tr.reject:
                 continue
             d = _unit(tr.b - tr.a) * pad
             if _segments_cross(prev_xz, cur_xz, tr.a - d, tr.b + d):
                 tr.traversed = True
 
+    def _mark_geometry(self):
+        """Width cap and the occupancy checks. Recomputed every frame, not latched.
+
+        ``wide`` is dropped for good this frame: not drawn, not a waypoint, and
+        not a traversal. The other reasons wait until the walls and the near
+        floor are actually in the map, then clear on their own.
+        """
+        for tr in self.tracks:
+            tr.reject = self._reject_reason(tr)
+            if tr.reject == "wide":
+                tr.traversed = False
+
+    def _reject_reason(self, tr):
+        """Empty when the opening may stay a portal. Otherwise ``wide``, ``jamb``, ``side``, or ``narrow``."""
+        if tr.abandoned:
+            return ""
+        if tr.width > self.config.max_portal_m:
+            return "wide"
+        if self.grid is None or self.pose is None:
+            return "jamb"
+        if not self._jambs_touch(tr):
+            return "jamb"
+        if not self._sides_open(tr):
+            return "side"
+        if not self._is_narrowest(tr):
+            return "narrow"
+        return ""
+
+    def _jambs_touch(self, tr):
+        reach = self.config.jamb_reach_m
+        return self._occupied_near(tr.a, reach) and self._occupied_near(tr.b, reach)
+
+    def _occupied_near(self, center, radius):
+        res = self.grid.res
+        span = int(math.ceil(radius / max(res, 1e-6)))
+        offsets = np.arange(-span, span + 1) * res
+        gx, gz = np.meshgrid(offsets, offsets)
+        pts = np.stack([gx.ravel(), gz.ravel()], axis=1)
+        pts = pts[np.linalg.norm(pts, axis=1) <= radius + 1e-6]
+        if len(pts) == 0:
+            return False
+        return bool((self.grid.codes(pts + np.asarray(center, dtype=np.float64)) == 2).any())
+
+    def _sides_open(self, tr):
+        """Near side is the agent's side and must be free. Far side may be unknown, not occupied."""
+        agent = self.pose[[0, 2], 3]
+        normal = _unit(tr.normal)
+        near = normal if float(np.dot(normal, agent - tr.center)) >= 0.0 else -normal
+        near_codes = self.grid.codes(self._side_points(tr, near))
+        far_codes = self.grid.codes(self._side_points(tr, -near))
+        if _share(near_codes, 2) >= 0.4 or _share(near_codes, 1) < 0.6:
+            return False
+        return _share(far_codes, 2) < 0.4
+
+    def _side_points(self, tr, direction):
+        ts = np.linspace(0.3, 0.7, 5)
+        base = tr.a[None, :] + ts[:, None] * (tr.b - tr.a)[None, :]
+        return base + np.asarray(direction, dtype=np.float64)[None, :] * self.config.side_offset_m
+
+    def _is_narrowest(self, tr):
+        """The opening is tighter than the passage within ``narrow_reach_m`` along its normal.
+
+        Samples at half a meter count as evidence that a side opens up. Only the
+        one-meter sample can reject the opening for being wider than a neighbor,
+        so a chair just inside the doorway does not erase the door.
+        """
+        direction = _unit(tr.b - tr.a)
+        normal = _unit(tr.normal)
+        here = self._passage_gap(tr.center, direction)
+        if here is None:
+            return False
+        slack = self.config.narrow_slack_m
+        wider = False
+        for sign in (1.0, -1.0):
+            mid = self._passage_gap(tr.center + normal * sign * 0.5, direction)
+            far = self._passage_gap(tr.center + normal * sign * min(1.0, self.config.narrow_reach_m), direction)
+            if (mid is not None and mid >= here + slack) or (far is not None and far >= here + slack):
+                wider = True
+            if far is not None and far < here - slack:
+                return False
+        return wider
+
+    def _passage_gap(self, origin, direction):
+        """Free width through ``origin`` along ``direction``, or ``None`` when a side is unknown.
+
+        A ray that stays free out to ``gap_search_m`` counts as that wide. Isolated
+        unknown or occupied cells do not close it; a run of either does.
+        """
+        origin = np.asarray(origin, dtype=np.float64)
+        if self._code_at(origin) != 1:
+            return None
+        left = self._gap_ray(origin, direction)
+        right = self._gap_ray(origin, -direction)
+        if left is None or right is None:
+            return None
+        return left + right
+
+    def _gap_ray(self, origin, direction):
+        step = self.grid.res
+        limit = self.config.gap_search_m
+        dist = step
+        while dist <= limit + 1e-6:
+            point = origin + direction * dist
+            code = self._code_at(point)
+            if code == 0:
+                # One unknown cell is a speck. A run of them is still unmapped.
+                if self._code_at(origin + direction * (dist + step)) == 0:
+                    return None
+            elif code == 2 and self._solid_obstacle(point):
+                return dist
+            dist += step
+        return limit
+
+    def _code_at(self, point):
+        return int(self.grid.codes([point])[0])
+
+    def _solid_obstacle(self, point):
+        """True when the hit is more than an isolated cell."""
+        rows, cols, ok = self.grid.cells([point])
+        if not ok[0]:
+            return False
+        row, col = int(rows[0]), int(cols[0])
+        lo = self.grid.logodds
+        patch = lo[max(0, row - 1):row + 2, max(0, col - 1):col + 2]
+        return int((patch > self.grid.config.occupied_logodds).sum()) >= 3
+
     def _refresh_states(self):
         c = self.config
+        self._mark_geometry()
         for tr in self.tracks:
             if not tr.traversed and not tr.abandoned:
                 behind = self._disk[self._disk @ tr.normal >= c.behind_min_m] + tr.center
@@ -777,7 +921,7 @@ class PortalMap:
             return "abandoned"
         if tr.traversed:
             return "traversed"
-        if tr.blocked or score <= c.invalid_score:
+        if tr.reject or tr.blocked or score <= c.invalid_score:
             return "invalid"
         # One jamb is not enough to offer the doorway as a goal.
         if not tr.full:
