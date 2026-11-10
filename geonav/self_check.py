@@ -514,6 +514,29 @@ def check_portal_geometry():
     unmapped_map._refresh_states()
     assert unmapped.reject == "", unmapped.reject
     assert unmapped.state == "candidate"
+
+    # One end on the left wall, the other in the room. A solid blob beside the
+    # free end is not a jamb: the segment does not run into it.
+    one_sided_map = _door_map()
+    _fill(one_sided_map.grid, -0.55, -1.05, -0.35, -0.85, "occ")
+    one_sided = _opening(9, [-1.68, -1.2], [-0.4, -1.2])
+    one_sided_map.tracks = [one_sided]
+    one_sided_map._refresh_states()
+    assert one_sided.reject == "jamb", one_sided.reject
+    assert one_sided.state == "invalid"
+    # The far end is still unknown, so a single mapped jamb is not evidence to drop it.
+    ahead = _opening(10, [-1.68, -1.2], [-1.68, 0.4])
+    one_sided_map.tracks.append(ahead)
+    one_sided_map._refresh_states()
+    assert ahead.reject == "", ahead.reject
+    # An isolated occupied cell is not a second jamb.
+    speck_map = _door_map()
+    rows, cols, ok = speck_map.grid.cells([[-0.75, -1.2]])
+    speck_map.grid.logodds[int(rows[0]), int(cols[0])] = speck_map.grid.config.occupied_logodds + 2.0
+    speck = _opening(11, [-0.9, -1.2], [0.2, -1.2])
+    speck_map.tracks = [speck]
+    speck_map._refresh_states()
+    assert speck.reject == "jamb", speck.reject
     assert PortalConfig().near_jamb_m == 0.8
 
     slanted_map = _door_map()

@@ -73,6 +73,9 @@ class MapConfig:
     max_portal_m: float = 2.5
     jamb_reach_m: float = 0.30
     jamb_align_deg: float = 40.0
+    # Cone around the segment when deciding whether an end actually runs into a wall.
+    # Wide enough for an oblique jamb, narrow enough that a wall beside the opening does not count.
+    jamb_cone_deg: float = 25.0
     side_offset_m: float = 0.40
     narrow_reach_m: float = 1.0
     narrow_slack_m: float = 0.15
@@ -831,10 +834,15 @@ class PortalMap:
         is diagonal and its normal misses the room. Search from the center for
         the direction that strikes both obstacles most squarely, and keep that
         span. Returns ``ok``, ``pending`` while the jambs are still unmapped,
-        or a rejection: ``jamb`` when an end sits in mapped open floor,
-        ``oblique`` when the map shows no head-on span, ``wide``.
+        or a rejection: ``jamb`` when an end sits in mapped open floor or only
+        one end runs into a wall, ``oblique`` when the map shows no head-on
+        span, ``wide``.
         """
         if self._end_in_open_floor(tr.a) or self._end_in_open_floor(tr.b):
+            return "jamb"
+        # One end meets a wall and the other already runs out into mapped floor.
+        # An unmapped end stays: there is no evidence yet that it lacks a jamb.
+        if self._one_sided(tr):
             return "jamb"
         if not self._jambs_touch(tr):
             return "pending"
@@ -853,12 +861,58 @@ class PortalMap:
         return "ok"
 
     def _end_in_open_floor(self, endpoint):
-        """True when the floor around ``endpoint`` is mapped free with no obstacle in reach."""
+        """True when the floor around ``endpoint`` is mapped free with no solid jamb in reach.
+
+        An isolated occupied cell is not a jamb. Unknown cells are not free, so an
+        end on the frontier of the map is kept.
+        """
         pts = self._disk_points(endpoint, self.config.jamb_reach_m)
         if len(pts) == 0:
             return False
         codes = self.grid.codes(pts)
-        return not (codes == 2).any() and _share(codes, 1) >= 0.6
+        if _share(codes, 1) < 0.6:
+            return False
+        occupied = pts[codes == 2]
+        return not any(self._solid_obstacle(point) for point in occupied)
+
+    def _one_sided(self, tr):
+        """True when one end runs into a wall and the other into mapped open floor.
+
+        Support is measured along the segment, not anywhere in the disk. A wall
+        beside the opening does not hold up an end that continues through free
+        cells. Unknown beyond an end is not open floor.
+        """
+        direction = _unit(tr.b - tr.a)
+        if float(np.linalg.norm(direction)) < 1e-9:
+            return False
+        support_a = self._jamb_support(tr.a, -direction)
+        support_b = self._jamb_support(tr.b, direction)
+        return (support_a == "wall" and support_b == "open") or (support_b == "wall" and support_a == "open")
+
+    def _jamb_support(self, endpoint, outward):
+        """``wall``, ``open``, or ``unknown`` just outside ``endpoint`` along ``outward``."""
+        if self._solid_obstacle(endpoint):
+            return "wall"
+        outward = _unit(outward)
+        if float(np.linalg.norm(outward)) < 1e-9:
+            return "unknown"
+        reach = self.config.jamb_reach_m
+        cone = self.config.jamb_cone_deg
+        step = 5 if cone >= 5 else 1
+        for deg in range(-int(cone), int(cone) + 1, step):
+            if self._ray_kind(endpoint, _rotate(outward, deg), reach) == "wall":
+                return "wall"
+        return self._ray_kind(endpoint, outward, reach)
+
+    def _ray_kind(self, origin, direction, reach):
+        """``wall`` when a solid obstacle is within ``reach``, else ``open`` or ``unknown``."""
+        direction = _unit(direction)
+        dist = self._gap_ray(origin, direction, reach)
+        if dist is None:
+            return "unknown"
+        if self._solid_obstacle(origin + direction * dist):
+            return "wall"
+        return "open"
 
     def _best_head_on_span(self, tr):
         """Shortest gap through the center that hits both walls head-on.
@@ -1016,9 +1070,9 @@ class PortalMap:
             return None
         return left + right
 
-    def _gap_ray(self, origin, direction):
+    def _gap_ray(self, origin, direction, limit=None):
         step = self.grid.res
-        limit = self.config.gap_search_m
+        limit = self.config.gap_search_m if limit is None else limit
         dist = step
         while dist <= limit + 1e-6:
             point = origin + direction * dist
