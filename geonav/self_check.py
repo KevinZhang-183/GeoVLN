@@ -108,6 +108,9 @@ def check_frontier_refresh():
     world.refresh_frontiers(pose)
     second_ids = {item.id for item in world.frontiers}
     assert second_ids and first_ids.isdisjoint(second_ids)
+    assert world.frontier_vis
+    image = world.render()
+    assert image is not None and image.size[0] > 0
 
     watched = _FakeWorld(make_grid())
     watched.refreshes = 0
@@ -648,10 +651,12 @@ def check_vis_video():
 
     from PIL import Image
 
-    from geonav.video import encode_saved_vis
+    from geonav.video import encode_saved_vis, vis_video_name
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "scene_1"
+        assert vis_video_name(root) == "vis_1.mp4"
+        assert vis_video_name(Path(tmp) / "goal" / "scene_1") == "vis_1_goal.mp4"
         vis = root / "vis"
         vis.mkdir(parents=True)
         Image.new("RGB", (64, 48), (255, 0, 0)).save(vis / "0000.jpg")

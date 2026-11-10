@@ -13,7 +13,7 @@ from geonav.episodes import episode_key, load_rows
 from geonav.executor import Executor
 from geonav.policy import Policy
 from geonav.sam3_client import Sam3Client
-from geonav.video import write_vis_video
+from geonav.video import vis_video_name, write_vis_video
 from geonav.world import World
 from portal_map import _agent_axes  # noqa: E402
 
@@ -194,7 +194,8 @@ def run_one(env, episode, row, args, client):
             print(f"  step {step:03d} {decision_reason}", flush=True)
             last_reason = decision_reason
         action_counts[action] = action_counts.get(action, 0) + 1
-        _save_vis(vis_dir, tick, rgb, world, executor, args.vis_stride, force=False)
+        _save_vis(vis_dir, tick, rgb, world, executor, args.vis_stride, force=world.frontier_vis)
+        world.frontier_vis = False
         if env.episode_over:
             break
         observation = env.step(actions[action])
@@ -238,7 +239,7 @@ def run_one(env, episode, row, args, client):
     (out_dir / "episode.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     final = world.render(executor.path, executor.waypoint)
     if final is not None:
-        final.save(out_dir / f"map_{episode_id}.jpg")
+        final.save(out_dir / f"map_{episode_id}_{mode}.jpg")
     coarse = world.render(
         executor.path,
         executor.waypoint,
@@ -246,11 +247,11 @@ def run_one(env, episode, row, args, client):
         inflate_m=executor.inflate_m,
     )
     if coarse is not None:
-        coarse.save(out_dir / f"map_coarse_{episode_id}.jpg")
+        coarse.save(out_dir / f"map_coarse_{episode_id}_{mode}.jpg")
     if start_xz is not None:
         frame_step = max(tick - 1, 0) if exhausted else tick
         _save_vis(vis_dir, frame_step, rgb, world, executor, args.vis_stride, force=True)
-    video = write_vis_video(vis_dir, out_dir / f"vis_{episode_id}.mp4", fps=getattr(args, "vis_fps", 5))
+    video = write_vis_video(vis_dir, out_dir / vis_video_name(out_dir), fps=getattr(args, "vis_fps", 5))
     if video is not None:
         print(f"  wrote {video}", flush=True)
     return payload
