@@ -324,9 +324,18 @@ def check_explored_door():
     decision = policy.decide(world, pose, 1)
     assert decision.kind == "waypoint" and decision.waypoint.name == "P4", decision.reason
 
+    far = _FakeWorld(grid)
+    distant = _Track(8, [0.0, 4.0], [0.0, 1.0], "candidate")
+    far.portals.tracks.append(distant)
+    far.active_portals = lambda: [distant]
+    walking = Policy("landmark", parsed, None, allow_look=True)
+    far_decision = walking.decide(far, pose, 0)
+    assert far_decision.kind == "waypoint" and far_decision.waypoint.name == "P8", far_decision.reason
+
     held = Policy("landmark", parsed, None, allow_look=True)
     held.lock = decision.waypoint
     held.ready = True
+    held.note_look(pose[[0, 2], 3])
     again = held.decide(world, pose, 1)
     assert again.kind == "waypoint" and again.waypoint.name == "P4"
 

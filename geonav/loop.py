@@ -179,8 +179,8 @@ def run_one(env, episode, row, args, client):
                 action = "move_forward"
                 decision_reason = "enter"
                 entry_nudges += 1
-            elif decision_reason in ("look", "approach"):
-                if decision_reason == "look":
+            elif decision_reason in ("look", "approach", "no candidate"):
+                if decision_reason != "approach":
                     entry_look_at = None
                 policy.allow_look = False
                 spin_left = LOOK_TURNS
@@ -211,7 +211,7 @@ def run_one(env, episode, row, args, client):
         if env.episode_over:
             break
         observation = env.step(actions[action])
-        step, look_charged = budget_step(step, decision_reason in ("look", "approach"), look_charged)
+        step, look_charged = budget_step(step, decision_reason in ("look", "approach", "no candidate"), look_charged)
         tick += 1
     else:
         exhausted = True
@@ -303,7 +303,7 @@ def _decide(policy, executor, world, pose, step):
     if decision.kind == "stop":
         return "stop", decision.reason, True
     if decision.kind == "look":
-        return "turn_left", "look", False
+        return "turn_left", decision.reason or "look", False
     if decision.kind == "action":
         return decision.action, decision.reason, False
     if action is None:

@@ -98,10 +98,13 @@ class Policy:
         if self._object_upgrade(world, pose):
             return Decision("waypoint", waypoint=self.lock, reason=self.lock.name)
         if self.lock is not None and self._lock_ok(world):
+            if self._approach_due(world, self.lock, pose):
+                self.lock = None
+                return Decision("look", reason="approach")
             return Decision("waypoint", waypoint=self.lock, reason=self.lock.name)
         choice = self._choose(world, pose)
         if choice is not None:
-            if self._approach_due(world, choice):
+            if self._approach_due(world, choice, pose):
                 return Decision("look", reason="approach")
             self.lock = choice
             self.did_backtrack = False
@@ -110,7 +113,7 @@ class Policy:
             # Walk through the doorway ahead and survey once inside.
             door = self._explored_ahead(world, pose)
             if door is not None:
-                if self._approach_due(world, door):
+                if self._approach_due(world, door, pose):
                     return Decision("look", reason="approach")
                 self.lock = door
                 self.did_backtrack = False
@@ -126,12 +129,19 @@ class Policy:
     def note_look(self, xz):
         self.looks.append(np.asarray(xz, dtype=np.float64).copy())
 
-    def _approach_due(self, world, waypoint):
-        """Look once before a door when nothing within 2 m has been surveyed."""
+    def _approach_due(self, world, waypoint, pose):
+        """Look once when the agent is already within 2 m of an unsurveyed door.
+
+        A door farther away is walked to first. Spinning in place there would
+        finish still outside the 2 m radius and start another look forever.
+        """
         if not self.survey or waypoint is None or not str(waypoint.name).startswith("P"):
             return False
         track = world.portals.track(waypoint.portal_id) if waypoint.portal_id is not None else None
         center = track.center if track is not None else waypoint.stages[0].xz
+        agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
+        if float(np.hypot(agent[0] - center[0], agent[1] - center[1])) > APPROACH_LOOK_M:
+            return False
         return not _near_look(self.looks, center, APPROACH_LOOK_M)
 
     def note_reached(self, waypoint):
