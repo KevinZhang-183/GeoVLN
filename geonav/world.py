@@ -177,37 +177,13 @@ def _on_obstacle(world, x, z):
     return int(grid.codes(point)[0]) == 2
 
 
-_FRONTIER_COLORS = (
-    (0, 175, 200),
-    (225, 110, 0),
-    (145, 60, 210),
-    (210, 50, 130),
-    (30, 160, 80),
-    (60, 85, 210),
-)
-
-
-def _ordered_trace(trace):
-    """Boundary cells in order along the opening, so the drawn line is one edge."""
-    points = np.atleast_2d(np.asarray(trace, dtype=np.float64))
-    if len(points) < 3:
-        return points
-    delta = points - points.mean(axis=0)
-    _, axes = np.linalg.eigh(delta.T @ delta)
-    return points[np.argsort(points @ axes[:, 1])]
-
-
 def _overlay(draw, to_px, world, path, waypoint):
     if path and len(path) > 1:
         draw.line([to_px(point) for point in path], fill=(255, 220, 0), width=2)
-    for index, frontier in enumerate(world.frontiers):
-        color = _FRONTIER_COLORS[index % len(_FRONTIER_COLORS)]
-        trace = getattr(frontier, "trace", None)
-        if trace is not None and len(trace) > 1:
-            draw.line([to_px(point) for point in _ordered_trace(trace)], fill=color, width=4)
+    for frontier in world.frontiers:
         x, y = to_px(frontier.xz)
-        draw.ellipse((x - 5, y - 5, x + 5, y + 5), fill=color, outline=color)
-        draw.text((x + 6, y - 8), f"F{frontier.id}", fill=color)
+        draw.ellipse((x - 4, y - 4, x + 4, y + 4), outline=(0, 220, 220))
+        draw.text((x + 4, y - 8), f"F{frontier.id}", fill=(0, 180, 180))
     for instance in world.semantic.instances:
         if _is_door(instance.label) or _on_obstacle(world, instance.x, instance.z):
             continue

@@ -61,7 +61,7 @@ def check_frontiers():
     grid.logodds[:] = 0.0
     grid.logodds[:, :25] = grid.config.free_logodds - 0.5
     grid.explored[:, :25] = True
-    points = frontiers(grid, np.array([-2.0, 0.0]), min_m=0.5)
+    points = frontiers(grid, np.array([-2.0, 0.0]))
     assert points, "explored space should produce a frontier"
     assert max(point.xz[0] for point in points) < 0.5
 
@@ -80,6 +80,12 @@ def check_frontiers():
     found = frontiers(hole_grid, np.zeros(2))
     assert found, "the far edge of the explored area is a frontier"
     assert all(item.xz[0] > 0.5 for item in found), [item.xz.tolist() for item in found]
+
+    short = OccupancyGrid(np.zeros(2), config)
+    patch = (np.abs(xx[None, :]) <= 0.15) & (np.abs(zz[:, None]) <= 0.15)
+    short.explored[:] = patch
+    short.logodds[patch] = config.free_logodds - 0.5
+    assert frontiers(short, np.zeros(2)) == [], "a boundary shorter than 1 m is not a waypoint"
 
 
 def check_frontier_refresh():
@@ -294,6 +300,10 @@ def check_look_budget():
     assert look_covers_entry(np.array([0.2, 0.0]), anchor)
     assert not look_covers_entry(np.array([3.0, 0.0]), anchor)
     assert not look_covers_entry(None, anchor)
+    from geonav.loop import entry_look_skipped
+
+    assert not entry_look_skipped("approach", np.array([0.2, 0.0]), anchor)
+    assert entry_look_skipped("entry", np.array([0.2, 0.0]), anchor)
 
 
 def check_explored_door():
@@ -309,6 +319,9 @@ def check_explored_door():
     pose = pose_at(0.0, 0.0, (0.0, 1.0))
     policy = Policy("landmark", parsed, None, allow_look=True)
     decision = policy.decide(world, pose, 0)
+    assert decision.kind == "look" and decision.reason == "approach", decision.reason
+    policy.note_look(pose[[0, 2], 3])
+    decision = policy.decide(world, pose, 1)
     assert decision.kind == "waypoint" and decision.waypoint.name == "P4", decision.reason
 
     held = Policy("landmark", parsed, None, allow_look=True)
@@ -651,7 +664,7 @@ def check_vis_video():
 
     from PIL import Image
 
-    from geonav.video import encode_saved_vis, vis_video_name
+    from geonav.video import clear_vis, encode_saved_vis, vis_video_name
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "scene_1"
@@ -659,6 +672,10 @@ def check_vis_video():
         assert vis_video_name(Path(tmp) / "goal" / "scene_1") == "vis_1_goal.mp4"
         vis = root / "vis"
         vis.mkdir(parents=True)
+        Image.new("RGB", (64, 48), (0, 0, 255)).save(vis / "0099.jpg")
+        Image.new("RGB", (64, 48), (255, 255, 255)).save(vis / "notes.png")
+        clear_vis(vis)
+        assert list(vis.iterdir()) == []
         Image.new("RGB", (64, 48), (255, 0, 0)).save(vis / "0000.jpg")
         Image.new("RGB", (64, 48), (0, 255, 0)).save(vis / "0010.jpg")
         written = encode_saved_vis(root, fps=5)

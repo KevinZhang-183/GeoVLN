@@ -20,6 +20,7 @@ TURNS = {
     "turn_right": ("turn_right", 6),
     "turn_around": ("turn_left", 12),
 }
+APPROACH_LOOK_M = 2.0
 TURN_NAMES = set(TURNS)
 
 
@@ -38,6 +39,7 @@ class Policy:
         self.steps = list(self.parsed.get("subtasks") or [])
         self.goal_xyz = None if goal_xyz is None else np.asarray(goal_xyz, dtype=np.float64)
         self.allow_look = allow_look
+        self.survey = allow_look
         self.index = 0
         self.lock = None
         self.pending = []
@@ -55,6 +57,7 @@ class Policy:
         self.last_xz = None
         self.step = 0
         self.ready = False
+        self.looks = []
 
     def prompts(self):
         """Phrases for SAM3. Goal follows the dataset point and does not build landmarks."""
@@ -98,6 +101,8 @@ class Policy:
             return Decision("waypoint", waypoint=self.lock, reason=self.lock.name)
         choice = self._choose(world, pose)
         if choice is not None:
+            if self._approach_due(world, choice):
+                return Decision("look", reason="approach")
             self.lock = choice
             self.did_backtrack = False
             return Decision("waypoint", waypoint=choice, reason=choice.name)
@@ -105,6 +110,8 @@ class Policy:
             # Walk through the doorway ahead and survey once inside.
             door = self._explored_ahead(world, pose)
             if door is not None:
+                if self._approach_due(world, door):
+                    return Decision("look", reason="approach")
                 self.lock = door
                 self.did_backtrack = False
                 return Decision("waypoint", waypoint=door, reason=door.name)
@@ -115,6 +122,17 @@ class Policy:
             self.lock = point_waypoint(f"N{node.id}", node.xz, radius=0.6, snap_m=1.0)
             return Decision("waypoint", waypoint=self.lock, reason="backtrack")
         return Decision("stop", reason="no candidate")
+
+    def note_look(self, xz):
+        self.looks.append(np.asarray(xz, dtype=np.float64).copy())
+
+    def _approach_due(self, world, waypoint):
+        """Look once before a door when nothing within 2 m has been surveyed."""
+        if not self.survey or waypoint is None or not str(waypoint.name).startswith("P"):
+            return False
+        track = world.portals.track(waypoint.portal_id) if waypoint.portal_id is not None else None
+        center = track.center if track is not None else waypoint.stages[0].xz
+        return not _near_look(self.looks, center, APPROACH_LOOK_M)
 
     def note_reached(self, waypoint):
         self.arrived_name = None if waypoint is None else waypoint.name
@@ -427,6 +445,15 @@ def prompts_for(parsed, index):
                 continue
             found.append(text)
     return found
+
+
+def _near_look(looks, xz, radius):
+    point = np.asarray(xz, dtype=np.float64)
+    for look in looks:
+        item = np.asarray(look, dtype=np.float64)
+        if float(np.hypot(item[0] - point[0], item[1] - point[1])) <= radius:
+            return True
+    return False
 
 
 def _side_ok(instance, pose, side):

@@ -71,7 +71,7 @@ class Frontier:
         self.trace = np.atleast_2d(np.asarray(trace, dtype=np.float64))
 
 
-def frontiers(grid, agent_xz, min_m=0.5, close_m=0.2, inflate_m=INFLATE_M):
+def frontiers(grid, agent_xz, min_m=1.0, close_m=0.2, inflate_m=INFLATE_M):
     """One stand point per segment of the explored-area boundary.
 
     The explored mask is closed through unknown cells for ``close_m``, without

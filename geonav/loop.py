@@ -13,7 +13,7 @@ from geonav.episodes import episode_key, load_rows
 from geonav.executor import Executor
 from geonav.policy import Policy
 from geonav.sam3_client import Sam3Client
-from geonav.video import vis_video_name, write_vis_video
+from geonav.video import clear_vis, vis_video_name, write_vis_video
 from geonav.world import World
 from portal_map import _agent_axes  # noqa: E402
 
@@ -53,6 +53,11 @@ def look_covers_entry(look_xz, anchor_xz, radius=0.8):
         return False
     delta = np.asarray(look_xz, dtype=np.float64) - np.asarray(anchor_xz, dtype=np.float64)
     return float(np.hypot(delta[0], delta[1])) <= radius
+
+
+def entry_look_skipped(look_kind, look_xz, anchor_xz):
+    """A survey before the door does not stand in for the one beyond it."""
+    return look_kind == "entry" and look_covers_entry(look_xz, anchor_xz)
 
 
 def run_episodes(args):
@@ -119,6 +124,7 @@ def run_one(env, episode, row, args, client):
     out_dir = Path(args.output) / args.mode / f"{scene}_{episode_id}"
     vis_dir = out_dir / "vis"
     vis_dir.mkdir(parents=True, exist_ok=True)
+    clear_vis(vis_dir)
     step = 0
     tick = 0
     exhausted = False
@@ -129,6 +135,7 @@ def run_one(env, episode, row, args, client):
     entry_forward = None
     entry_nudges = 0
     look_at = None
+    look_kind = "opening" if spin_left else ""
     stop_reason = "max_steps"
     last_reason = None
     start_xz = None
@@ -148,9 +155,14 @@ def run_one(env, episode, row, args, client):
             entry_forward = np.asarray(_agent_axes(pose)[0], dtype=np.float64).copy()
             entry_nudges = 0
             policy.allow_look = True
+        if spin_done:
+            policy.note_look(agent_xz)
+            policy.allow_look = False
+            world.refresh_frontiers(pose)
+            spin_done = False
         if entry_look_at is not None and spin_left == 0 and entry_look_due(entry_look_at, entry_forward, agent_xz):
-            # This doorway was already surveyed from the threshold.
-            if look_covers_entry(look_at, entry_look_at):
+            # A look before the door does not replace the survey of the room beyond it.
+            if entry_look_skipped(look_kind, look_at, entry_look_at):
                 entry_look_at = None
                 policy.allow_look = False
             else:
@@ -158,23 +170,23 @@ def run_one(env, episode, row, args, client):
                 spin_left = LOOK_TURNS
                 look_charged = False
                 look_at = agent_xz.copy()
+                look_kind = "entry"
         if spin_left == 0:
-            if spin_done:
-                policy.allow_look = False
-            if frontier_refresh_due(spin_done, world.frontiers_ready):
+            if frontier_refresh_due(False, world.frontiers_ready):
                 world.refresh_frontiers(pose)
-            spin_done = False
             action, decision_reason, stop = _decide(policy, executor, world, pose, step)
             if decision_reason == "look" and entry_look_at is not None and entry_nudges < ENTRY_NUDGES:
                 action = "move_forward"
                 decision_reason = "enter"
                 entry_nudges += 1
-            elif decision_reason == "look":
-                entry_look_at = None
+            elif decision_reason in ("look", "approach"):
+                if decision_reason == "look":
+                    entry_look_at = None
                 policy.allow_look = False
                 spin_left = LOOK_TURNS
                 look_charged = False
                 look_at = agent_xz.copy()
+                look_kind = "approach" if decision_reason == "approach" else "survey"
                 action = "turn_left"
             elif _made_progress(decision_reason):
                 policy.allow_look = True
@@ -199,7 +211,7 @@ def run_one(env, episode, row, args, client):
         if env.episode_over:
             break
         observation = env.step(actions[action])
-        step, look_charged = budget_step(step, decision_reason == "look", look_charged)
+        step, look_charged = budget_step(step, decision_reason in ("look", "approach"), look_charged)
         tick += 1
     else:
         exhausted = True

@@ -8,6 +8,16 @@ import numpy as np
 from PIL import Image
 
 
+def clear_vis(vis_dir):
+    """Drop frames left by an earlier run so they are not encoded into this video."""
+    vis_dir = Path(vis_dir)
+    if not vis_dir.is_dir():
+        return
+    for path in vis_dir.iterdir():
+        if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+            path.unlink()
+
+
 def write_vis_video(vis_dir, out_path, fps=5):
     """Write ``vis/0000.jpg`` ... into ``out_path``. Returns the path, or None."""
     frames = _frame_paths(vis_dir)
