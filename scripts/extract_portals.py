@@ -28,7 +28,7 @@ class PortalConfig:
     camera_height: float = 1.25
     depth_min: float = 0.2
     depth_max: float = 10.0
-    near_jamb_m: float = 1.2
+    near_jamb_m: float = 0.8
     min_width_m: float = 0.40
     max_width_m: float = 2.5
     edge_max_width_m: float = 2.5
@@ -355,7 +355,11 @@ def detect(depth, config=None):
             extra += 1
         if jamb_z > config.far_jamb_m and y1 < int(height * 0.72):
             continue
-        width_m = (right - left) / fx * max(float(jamb_z), 0.4)
+        span = (int(left), int(right))
+        left_jamb, right_jamb = _jamb_depths(body, span, jamb_z, config)
+        # Ground distance between the two jambs, so an obliquely seen door keeps its real width.
+        seg = doorway_segment(span, jamb_z, depth.shape, config, left_jamb, right_jamb)
+        width_m = float(np.linalg.norm(seg[1] - seg[0]))
         if width_m < config.min_width_m:
             continue
         potential = width_m * (inside_z - float(jamb_z))
@@ -365,9 +369,7 @@ def detect(depth, config=None):
             min(width - 1, int(right) + config.box_pad_x),
             min(height - 1, int(y1) + config.box_pad_y),
         )
-        span = (int(left), int(right))
         reason = _gate(config, depth, body, box, span, width_m, inside_z, jamb_z, fx)
-        left_jamb, right_jamb = _jamb_depths(body, span, jamb_z, config)
         portal = Portal(
             "dropped" if reason else "opening",
             box,
@@ -562,7 +564,7 @@ def main():
     parser.add_argument("--episode", help="One episode folder with rgb/ and depth/.")
     parser.add_argument("--out-name", default="portals")
     parser.add_argument("--stride", type=int, default=4)
-    parser.add_argument("--near-jamb", type=float, default=1.2)
+    parser.add_argument("--near-jamb", type=float, default=0.8)
     parser.add_argument("--no-crops", action="store_true")
     args = parser.parse_args()
     if not args.frames and not args.episode:

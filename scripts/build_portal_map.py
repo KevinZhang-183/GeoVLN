@@ -130,7 +130,7 @@ def main():
     parser.add_argument("--episode", help="One episode folder with rgb/, depth/ and meta.json.")
     parser.add_argument("--out-name", default="portal_map")
     parser.add_argument("--stride", type=int, default=1)
-    parser.add_argument("--near-jamb", type=float, default=1.2)
+    parser.add_argument("--near-jamb", type=float, default=0.8)
     parser.add_argument("--resolution", type=float, default=0.05)
     parser.add_argument("--no-frames", action="store_true", help="Only write describe.txt and portal_map.json.")
     args = parser.parse_args()

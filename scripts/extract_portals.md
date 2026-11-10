@@ -43,7 +43,7 @@ python scripts/extract_portals.py --frames /path/to/r2r_frames --out-name portal
 只跑一条轨迹：
 
 ```bash
-python scripts/extract_portals.py --episode /path/to/episode --near-jamb 1.2
+python scripts/extract_portals.py --episode /path/to/episode --near-jamb 0.8
 ```
 
 `--no-crops` 不保存开口裁图。深度若是 0 到 1 的归一化值（整幅最大值不超过 1.5），会乘以 `depth_max` 还原成米。
@@ -63,7 +63,7 @@ from scripts.extract_portals import (
     load_depth,
 )
 
-config = PortalConfig(near_jamb_m=1.2)
+config = PortalConfig(near_jamb_m=0.8)
 depth = load_depth("depth/028.npy", config)
 openings, edges, dropped = detect(depth, config)
 
@@ -105,10 +105,10 @@ stamp_occupancy(grid, origin_xz, resolution, world_xz, value)
 | `camera_height` | 1.25 | 相机离地高度，米。用来判断开口有没有落到地面 |
 | `depth_min` | 0.2 | 小于这个值的深度视为无效 |
 | `depth_max` | 10 | 深度上限，也是归一化深度的还原倍数 |
-| `near_jamb_m` | 1.2 | 门框距离小于这个值则不画框。人已经站在门口，画面几乎全是洞内 |
-| `min_width_m` | 0.40 | 开口窄于这个值则丢掉 |
-| `max_width_m` | 3.15 | 开口宽于这个值则丢掉。空房间的远墙经常更宽 |
-| `edge_max_width_m` | 2.45 | 贴边开口宽于这个值则丢掉，避免把半个房间当成门 |
+| `near_jamb_m` | 0.8 | 门框距离小于这个值则不画框。人已经站在门口，画面几乎全是洞内 |
+| `min_width_m` | 0.40 | 开口窄于这个值则丢掉。宽度是两端门框在地面上的距离，斜着看的门不会被算窄 |
+| `max_width_m` | 2.5 | 开口宽于这个值则丢掉。空房间的远墙经常更宽 |
+| `edge_max_width_m` | 2.5 | 贴边开口宽于这个值则丢掉，避免把半个房间当成门 |
 | `min_aspect` | 1.25 | 框高除以框宽。宽于 `squat_min_width_m` 又比这个更扁，视为房间而不是门 |
 | `squat_min_width_m` | 1.5 | 只有宽过这个值才检查扁框 |
 | `rise_m` | 1.35 | 一列比旁边远多少米，才算跨过门框 |

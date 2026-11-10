@@ -9,7 +9,7 @@ from geonav._bootstrap import install
 install()
 
 from parse_instructions import _landmark, _place_only  # noqa: E402
-from portal_map import _agent_axes  # noqa: E402
+from portal_map import NOT_A_DOOR, _agent_axes  # noqa: E402
 
 from geonav.geom import bearing_deg, plan  # noqa: E402
 from geonav.waypoints import landmark_waypoint, point_waypoint, portal_waypoint, stand_point  # noqa: E402
@@ -332,10 +332,11 @@ class Policy:
         landmark = current.get("landmark") or ""
         room = action == "exit" or (action == "go_to" and _place_only(landmark))
         if room or (action == "go_to" and _is_door(landmark)):
-            # A span wider than a door is not a crossing, even if the path walked over it.
+            # A span too wide or too diagonal to be a door is not a crossing, even if the path walked over it.
             crossed = [
                 track for track in world.portals.tracks
-                if track.traversed and track.id not in self.baseline and getattr(track, "reject", "") != "wide"
+                if track.traversed and track.id not in self.baseline
+                and getattr(track, "reject", "") not in NOT_A_DOOR
             ]
             if crossed:
                 return True

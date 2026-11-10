@@ -41,6 +41,8 @@ STATE_COLORS = {
 # Invalid openings are rejected; explored space is already on the occupancy grid.
 UNDRAWN = ("invalid", "explored")
 ACTIVE = ("candidate", "confirmed")
+# Rejections that mean the span is not a door at all, so crossing it is not a traversal.
+NOT_A_DOOR = ("wide", "oblique")
 
 
 @dataclass
@@ -774,10 +776,14 @@ class PortalMap:
             tr.misses += 1
 
     def _check_traversal(self, prev_xz, cur_xz):
-        """A rejected opening is not a door, so crossing it does not count."""
+        """Crossing counts unless the span is too wide or diagonal to be a door.
+
+        ``jamb``, ``side`` and ``narrow`` can be wrong while the map is still
+        filling in, so walking through such an opening still counts.
+        """
         pad = self.config.traverse_pad_m
         for tr in self.tracks:
-            if tr.traversed or tr.reject:
+            if tr.traversed or tr.reject in NOT_A_DOOR:
                 continue
             d = _unit(tr.b - tr.a) * pad
             if _segments_cross(prev_xz, cur_xz, tr.a - d, tr.b + d):
@@ -786,9 +792,10 @@ class PortalMap:
     def _mark_geometry(self):
         """Width cap and the occupancy checks. Recomputed every frame, not latched.
 
-        ``wide`` is dropped for good this frame: not drawn, not a waypoint, and
-        not a traversal. The other reasons wait until the walls and the near
-        floor are actually in the map, then clear on their own.
+        A check only rejects on evidence already in the map. While the walls or
+        the floor around an opening are still unknown, it stays a portal.
+        ``wide`` and ``oblique`` are not doors: not drawn, not a waypoint, and
+        not a traversal.
         """
         for tr in self.tracks:
             tr.reject = self._reject_reason(tr)
@@ -800,23 +807,20 @@ class PortalMap:
 
         Otherwise ``wide``, ``oblique``, ``jamb``, ``side``, or ``narrow``.
         A side view is straightened onto the jamb-to-jamb line before the other
-        checks, so the normal points through the doorway. A line that does not
-        meet both obstacles head-on is dropped.
+        checks, so the normal points through the doorway.
         """
         if tr.abandoned:
             return ""
-        if self.grid is None or self.pose is None:
-            return "jamb"
-        aligned = self._align_to_jambs(tr)
-        if tr.width > self.config.max_portal_m or aligned == "wide":
+        if tr.width > self.config.max_portal_m:
             return "wide"
-        if aligned != "ok":
+        if self.grid is None or self.pose is None:
+            return ""
+        aligned = self._align_to_jambs(tr)
+        if aligned in ("wide", "oblique", "jamb"):
             return aligned
-        if not self._jambs_touch(tr):
-            return "jamb"
-        if not self._sides_open(tr):
+        if self._side_blocked(tr):
             return "side"
-        if not self._is_narrowest(tr):
+        if self._not_narrowest(tr):
             return "narrow"
         return ""
 
@@ -826,13 +830,17 @@ class PortalMap:
         A side view drops the endpoints on the jamb corners, so the drawn line
         is diagonal and its normal misses the room. Search from the center for
         the direction that strikes both obstacles most squarely, and keep that
-        span. If no such span exists, the line is oblique and is not a door.
+        span. Returns ``ok``, ``pending`` while the jambs are still unmapped,
+        or a rejection: ``jamb`` when an end sits in mapped open floor,
+        ``oblique`` when the map shows no head-on span, ``wide``.
         """
-        if not self._jambs_touch(tr):
+        if self._end_in_open_floor(tr.a) or self._end_in_open_floor(tr.b):
             return "jamb"
-        span = self._best_head_on_span(tr)
+        if not self._jambs_touch(tr):
+            return "pending"
+        span, measured = self._best_head_on_span(tr)
         if span is None:
-            return "oblique"
+            return "oblique" if measured else "pending"
         new_a, new_b = span
         if float(np.linalg.norm(new_b - new_a)) > self.config.max_portal_m:
             return "wide"
@@ -844,22 +852,39 @@ class PortalMap:
         tr.normal = normal
         return "ok"
 
+    def _end_in_open_floor(self, endpoint):
+        """True when the floor around ``endpoint`` is mapped free with no obstacle in reach."""
+        pts = self._disk_points(endpoint, self.config.jamb_reach_m)
+        if len(pts) == 0:
+            return False
+        codes = self.grid.codes(pts)
+        return not (codes == 2).any() and _share(codes, 1) >= 0.6
+
     def _best_head_on_span(self, tr):
-        """Endpoints of the shortest gap through the center that hits both walls head-on."""
+        """Shortest gap through the center that hits both walls head-on.
+
+        Returns ``(span, measured)``. ``measured`` is true when at least one
+        direction was mapped on both sides, so a missing span is evidence and
+        not just unknown floor.
+        """
         center = tr.center
         if self._code_at(center) != 1:
-            return None
+            return None, False
         base = _unit(tr.b - tr.a)
         if float(np.linalg.norm(base)) < 1e-9:
-            return None
+            return None, False
         limit = math.cos(math.radians(self.config.jamb_align_deg))
         inset = max(self.grid.res, 1e-3)
         best = None
+        measured = False
         for deg in range(-80, 81, 5):
             direction = _rotate(base, deg)
             pos = self._wall_hit(center, direction)
             neg = self._wall_hit(center, -direction)
             if pos is None or neg is None:
+                continue
+            measured = True
+            if pos[1] is None or neg[1] is None:
                 continue
             dist_pos, out_pos = pos
             dist_neg, out_neg = neg
@@ -881,20 +906,19 @@ class PortalMap:
                 continue
             best = (score, width, new_a, new_b)
         if best is None:
-            return None
-        return best[2], best[3]
+            return None, measured
+        return (best[2], best[3]), measured
 
     def _wall_hit(self, origin, direction):
-        """Distance to a solid obstacle and the direction back out of that obstacle."""
+        """``(distance, outward)`` at a solid obstacle, ``(distance, None)`` when the
+        ray ran through mapped open floor, or ``None`` when it reached unknown."""
         dist = self._gap_ray(origin, direction)
         if dist is None:
             return None
         point = origin + direction * dist
         if not self._solid_obstacle(point):
-            return None
+            return dist, None
         outward, _contact = self._jamb_outward(point)
-        if outward is None:
-            return None
         return dist, outward
 
     def _jamb_outward(self, endpoint):
@@ -909,7 +933,7 @@ class PortalMap:
             return None, None
         return _unit(outward), nearest
 
-    def _occupied_points(self, center, radius):
+    def _disk_points(self, center, radius):
         center = np.asarray(center, dtype=np.float64)
         res = self.grid.res
         span = int(math.ceil(radius / max(res, 1e-6)))
@@ -917,9 +941,12 @@ class PortalMap:
         gx, gz = np.meshgrid(offsets, offsets)
         delta = np.stack([gx.ravel(), gz.ravel()], axis=1)
         delta = delta[np.linalg.norm(delta, axis=1) <= radius + 1e-6]
-        if len(delta) == 0:
+        return delta + center
+
+    def _occupied_points(self, center, radius):
+        pts = self._disk_points(center, radius)
+        if len(pts) == 0:
             return np.zeros((0, 2))
-        pts = delta + center
         return pts[self.grid.codes(pts) == 2]
 
     def _jambs_touch(self, tr):
@@ -927,38 +954,33 @@ class PortalMap:
         return self._occupied_near(tr.a, reach) and self._occupied_near(tr.b, reach)
 
     def _occupied_near(self, center, radius):
-        res = self.grid.res
-        span = int(math.ceil(radius / max(res, 1e-6)))
-        offsets = np.arange(-span, span + 1) * res
-        gx, gz = np.meshgrid(offsets, offsets)
-        pts = np.stack([gx.ravel(), gz.ravel()], axis=1)
-        pts = pts[np.linalg.norm(pts, axis=1) <= radius + 1e-6]
+        pts = self._disk_points(center, radius)
         if len(pts) == 0:
             return False
-        return bool((self.grid.codes(pts + np.asarray(center, dtype=np.float64)) == 2).any())
+        return bool((self.grid.codes(pts) == 2).any())
 
-    def _sides_open(self, tr):
-        """Near side is the agent's side and must be free. Far side may be unknown, not occupied."""
+    def _side_blocked(self, tr):
+        """True when either side of the opening is already mostly obstacle. Unknown floor does not count."""
         agent = self.pose[[0, 2], 3]
         normal = _unit(tr.normal)
         near = normal if float(np.dot(normal, agent - tr.center)) >= 0.0 else -normal
         near_codes = self.grid.codes(self._side_points(tr, near))
         far_codes = self.grid.codes(self._side_points(tr, -near))
-        if _share(near_codes, 2) >= 0.4 or _share(near_codes, 1) < 0.6:
-            return False
-        return _share(far_codes, 2) < 0.4
+        return _share(near_codes, 2) >= 0.4 or _share(far_codes, 2) >= 0.4
 
     def _side_points(self, tr, direction):
         ts = np.linspace(0.3, 0.7, 5)
         base = tr.a[None, :] + ts[:, None] * (tr.b - tr.a)[None, :]
         return base + np.asarray(direction, dtype=np.float64)[None, :] * self.config.side_offset_m
 
-    def _is_narrowest(self, tr):
-        """The opening is tighter than the passage within ``narrow_reach_m`` along its normal.
+    def _not_narrowest(self, tr):
+        """True when the map shows the opening is not a pinch point.
 
-        Samples at half a meter count as evidence that a side opens up. Only the
-        one-meter sample can reject the opening for being wider than a neighbor,
-        so a chair just inside the doorway does not erase the door.
+        Two kinds of evidence: the passage one meter away is clearly narrower
+        than here, or both sides are measured and neither opens up, as in a line
+        across the middle of a corridor. Unmeasured sides never reject. Only the
+        one-meter sample can show a narrower neighbor, so a chair just inside the
+        doorway does not erase the door.
         """
         direction = _unit(tr.b - tr.a)
         normal = _unit(tr.normal)
@@ -967,14 +989,17 @@ class PortalMap:
             return False
         slack = self.config.narrow_slack_m
         wider = False
+        measured_sides = 0
         for sign in (1.0, -1.0):
             mid = self._passage_gap(tr.center + normal * sign * 0.5, direction)
             far = self._passage_gap(tr.center + normal * sign * min(1.0, self.config.narrow_reach_m), direction)
+            if mid is not None or far is not None:
+                measured_sides += 1
             if (mid is not None and mid >= here + slack) or (far is not None and far >= here + slack):
                 wider = True
             if far is not None and far < here - slack:
-                return False
-        return wider
+                return True
+        return measured_sides == 2 and not wider
 
     def _passage_gap(self, origin, direction):
         """Free width through ``origin`` along ``direction``, or ``None`` when a side is unknown.

@@ -505,6 +505,16 @@ def check_portal_geometry():
     corridor._refresh_states()
     assert hall.reject == "narrow", hall.reject
     assert hall.state == "invalid"
+    corridor._check_traversal(np.array([0.0, -0.5]), np.array([0.0, 0.5]))
+    assert hall.traversed, "a narrow-rejected opening still counts when walked through"
+
+    unmapped_map = _door_map()
+    unmapped = _opening(8, [-0.45, 4.0], [0.45, 4.0])
+    unmapped_map.tracks = [unmapped]
+    unmapped_map._refresh_states()
+    assert unmapped.reject == "", unmapped.reject
+    assert unmapped.state == "candidate"
+    assert PortalConfig().near_jamb_m == 0.8
 
     slanted_map = _door_map()
     slanted = _opening(6, [-0.45, -0.15], [0.45, 0.18], normal=(-0.35, 0.94))
