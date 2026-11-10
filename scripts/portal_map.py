@@ -310,6 +310,8 @@ class OccupancyGrid:
         self.res = config.resolution
         n = int(round(config.size_m / config.resolution))
         self.logodds = np.zeros((n, n), dtype=np.float32)
+        # Seen ground, grown only by the camera wedge. Obstacles are not explored.
+        self.explored = np.zeros((n, n), dtype=bool)
         self.origin = np.asarray(center_xz, dtype=np.float64) - config.size_m / 2.0
         self._prev_hit = np.zeros((n, n), dtype=bool)
         self._hit_frames = np.zeros((n, n), dtype=np.uint16)
@@ -342,11 +344,12 @@ class OccupancyGrid:
     def integrate(self, depth, pose, portal_config):
         """Ray-cast one depth frame.
 
-        Explored ground is the camera wedge: from the robot out to the first
-        surface in each column, not the strip of cells the robot has walked.
-        The wedge stops at an occupied cell, so a table that has left the image
-        stays occupied and the space behind it stays unseen. Obstacle hits are
-        every body point in the height band, and the log-odds rise only when
+        Explored ground is the camera wedge, recorded on ``explored`` and only
+        grown from there: from the robot out to the first surface in each column,
+        not the strip of cells the robot has walked. The wedge stops at an
+        occupied cell, so a table that has left the image stays occupied and the
+        space behind it stays unseen. Obstacle hits are every body point in the
+        height band, and the log-odds rise only when
         that cell repeats across frames.
         """
         c, pc = self.config, portal_config
@@ -402,7 +405,11 @@ class OccupancyGrid:
         self._prev_hit = hit_now
         lo[foot] = np.minimum(lo[foot], c.free_logodds - c.miss_logodds)
         np.clip(lo, -c.clamp_logodds, c.clamp_logodds, out=lo)
+        seen = self.explored.reshape(-1)
+        seen[free] = True
+        seen[foot] = True
         self._cleanup()
+        self.explored[self.logodds > c.occupied_logodds] = False
 
     def _cleanup(self):
         """Drop occupied islands with no free corridor, then fill speckled unknown cells.
@@ -436,6 +443,7 @@ class OccupancyGrid:
             if not holes.any():
                 break
             lo[holes] = c.free_logodds - 0.05
+            self.explored[holes] = True
 
     def known_bounds(self):
         """World (x, z) min and max of all known cells, or ``None``."""

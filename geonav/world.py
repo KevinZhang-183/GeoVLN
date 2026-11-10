@@ -19,10 +19,11 @@ DOOR_WORDS = {"door", "doors", "doorway", "doorways", "arch", "archway"}
 
 
 class Marker:
-    def __init__(self, index, xz, portal_id=None):
+    def __init__(self, index, xz, portal_id=None, trace=None):
         self.id = int(index)
         self.xz = np.asarray(xz, dtype=np.float64)
         self.portal_id = portal_id
+        self.trace = None if trace is None else np.atleast_2d(np.asarray(trace, dtype=np.float64))
 
 
 class World:
@@ -33,6 +34,7 @@ class World:
         self.key_move_m = key_move_m
         self.key_turn_deg = key_turn_deg
         self.frontiers = []
+        self.frontiers_ready = False
         self.nodes = []
         self.new_traversals = []
         self.sam3_calls = 0
@@ -55,18 +57,6 @@ class World:
         after = {track.id for track in self.portals.tracks if track.traversed}
         self.new_traversals = sorted(after - before)
         self._add_nodes(pose, step)
-        agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
-        hidden = self.portals._hidden_ids()
-        portals = [
-            track.center
-            for track in self.portals.tracks
-            if track.state in ("candidate", "confirmed", "traversed") and track.id not in hidden
-        ]
-        self.frontiers = _associate(
-            self.frontiers,
-            find_frontiers(self.grid, agent, portals_xz=portals),
-            self._next_frontier_id,
-        )
         if prompts and self._due(pose):
             self._segment(rgb, depth_m, pose, step, prompts)
 
@@ -154,29 +144,23 @@ class World:
         self.nodes.append(Marker(self._node_seq, xz, crossed))
         self._node_seq += 1
 
+    def refresh_frontiers(self, pose):
+        """Replace the frontier list from the explored boundary at this pose.
+
+        The previous points are dropped. Ids are not reused, so a frontier
+        locked during the last step cannot stick to a new opening.
+        """
+        agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
+        self.frontiers = [
+            Marker(self._next_frontier_id(), item.xz, trace=item.trace)
+            for item in find_frontiers(self.grid, agent)
+        ]
+        self.frontiers_ready = True
+
     def _next_frontier_id(self):
         value = self._frontier_seq
         self._frontier_seq += 1
         return value
-
-
-def _associate(previous, points, new_id, max_dist=1.0):
-    used = set()
-    assigned = []
-    for xz in points:
-        best, best_dist = None, max_dist
-        for marker in previous:
-            if marker.id in used:
-                continue
-            dist = float(np.hypot(marker.xz[0] - xz[0], marker.xz[1] - xz[1]))
-            if dist < best_dist:
-                best, best_dist = marker, dist
-        if best is None:
-            assigned.append(Marker(new_id(), xz))
-        else:
-            used.add(best.id)
-            assigned.append(Marker(best.id, xz))
-    return assigned
 
 
 def _is_door(label):

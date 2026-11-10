@@ -22,6 +22,11 @@ ENTRY_LOOK_M = 0.5
 ENTRY_NUDGES = 4
 
 
+def frontier_refresh_due(look_finished, ready):
+    """Extract frontiers after a look, and once before the first choice."""
+    return bool(look_finished or not ready)
+
+
 def budget_step(step, looking, charged):
     """A whole look counts as one budget step, charged on its first turn."""
     if looking:
@@ -156,7 +161,9 @@ def run_one(env, episode, row, args, client):
         if spin_left == 0:
             if spin_done:
                 policy.allow_look = False
-                spin_done = False
+            if frontier_refresh_due(spin_done, world.frontiers_ready):
+                world.refresh_frontiers(pose)
+            spin_done = False
             action, decision_reason, stop = _decide(policy, executor, world, pose, step)
             if decision_reason == "look" and entry_look_at is not None and entry_nudges < ENTRY_NUDGES:
                 action = "move_forward"
@@ -259,12 +266,17 @@ def _decide(policy, executor, world, pose, step):
     action = None
     decision = None
     for _ in range(4):
+        finished = False
         if executor.abandoned and executor.waypoint is not None:
             policy.abandon(executor.waypoint, world)
             executor.clear()
+            finished = True
         if executor.reached and executor.waypoint is not None:
             policy.note_reached(executor.waypoint)
             executor.clear()
+            finished = True
+        if finished:
+            world.refresh_frontiers(pose)
         decision = policy.decide(world, pose, step)
         if decision.kind != "waypoint":
             break

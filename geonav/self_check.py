@@ -60,9 +60,84 @@ def check_frontiers():
     grid = make_grid(free=False)
     grid.logodds[:] = 0.0
     grid.logodds[:, :25] = grid.config.free_logodds - 0.5
-    points = frontiers(grid, np.array([-2.0, 0.0]), min_m=0.5, pull_m=0.5)
-    assert points, "open space should produce a frontier"
-    assert max(point[0] for point in points) < 0.5
+    grid.explored[:, :25] = True
+    points = frontiers(grid, np.array([-2.0, 0.0]), min_m=0.5)
+    assert points, "explored space should produce a frontier"
+    assert max(point.xz[0] for point in points) < 0.5
+
+    # A hole inside the explored area is not an opening. The real edge is the far side.
+    config = MapConfig()
+    config.resolution = 0.05
+    config.size_m = 8.0
+    hole_grid = OccupancyGrid(np.zeros(2), config)
+    count = hole_grid.logodds.shape[0]
+    xx = hole_grid.origin[0] + (np.arange(count) + 0.5) * hole_grid.res
+    zz = hole_grid.origin[1] + (np.arange(count) + 0.5) * hole_grid.res
+    seen = xx[None, :] < 1.0
+    hole = (np.abs(xx[None, :]) <= 0.15) & (np.abs(zz[:, None]) <= 0.15)
+    hole_grid.explored[:] = seen & ~hole
+    hole_grid.logodds[hole_grid.explored] = config.free_logodds - 0.5
+    found = frontiers(hole_grid, np.zeros(2))
+    assert found, "the far edge of the explored area is a frontier"
+    assert all(item.xz[0] > 0.5 for item in found), [item.xz.tolist() for item in found]
+
+
+def check_frontier_refresh():
+    """Frontiers change when a waypoint or a look finishes, not on every depth frame."""
+    from geonav.loop import _decide, frontier_refresh_due
+    from geonav.world import World
+
+    assert frontier_refresh_due(True, True)
+    assert frontier_refresh_due(False, False)
+    assert not frontier_refresh_due(False, True)
+
+    world = World(sam3=None)
+    grid = make_grid(free=False)
+    grid.logodds[:, :25] = grid.config.free_logodds - 0.5
+    grid.explored[:, :25] = True
+    world.portals.grid = grid
+    pose = pose_at(-1.5, 0.0, (1.0, 0.0))
+    assert frontier_refresh_due(False, world.frontiers_ready)
+    world.refresh_frontiers(pose)
+    assert world.frontiers_ready
+    assert world.frontiers, "the explored edge should be snapshotted"
+    first_ids = {item.id for item in world.frontiers}
+    held = world.frontiers
+    world.update(np.full((8, 8), 2.0, dtype=np.float32), pose, None, 1, [])
+    assert world.frontiers is held, "a depth frame must not rebuild frontiers"
+    world.refresh_frontiers(pose)
+    second_ids = {item.id for item in world.frontiers}
+    assert second_ids and first_ids.isdisjoint(second_ids)
+
+    watched = _FakeWorld(make_grid())
+    watched.refreshes = 0
+
+    def refresh(pose, watched=watched):
+        del pose
+        watched.refreshes += 1
+        watched.frontiers_ready = True
+
+    watched.refresh_frontiers = refresh
+    watched.frontiers_ready = False
+    parsed = {
+        "end_landmark": "chair",
+        "subtasks": [
+            {"id": 1, "action": "turn_left", "landmark": "", "near": "", "side": ""},
+            {"id": 2, "action": "go_to", "landmark": "chair", "near": "", "side": ""},
+            {"id": 3, "action": "stop", "landmark": "chair", "near": "", "side": ""},
+        ],
+    }
+    policy = Policy("landmark", parsed, None, allow_look=False)
+    turn_pose = pose_at(0.0, 0.0, (0.0, 1.0))
+    for step in range(7):
+        policy.decide(watched, turn_pose, step)
+    assert watched.refreshes == 0, watched.refreshes
+
+    executor = Executor()
+    executor.set_waypoint(_goal_waypoint())
+    executor.reached = True
+    _decide(policy, executor, watched, turn_pose, 8)
+    assert watched.refreshes == 1, watched.refreshes
 
 
 def check_stuck():
@@ -379,6 +454,18 @@ def check_occupancy_keeps_furniture():
     assert value(0.0, -1.5) == 0.0
     assert value(0.0, 2.8) >= config.free_logodds
 
+    def explored_at(x, z):
+        row, col = _cell(grid, x, z)
+        return bool(grid.explored[row, col])
+
+    assert explored_at(0.0, 0.4)
+    assert explored_at(0.8, 2.5)
+    assert not explored_at(0.0, -1.5)
+    assert not explored_at(0.0, 2.8)
+    table_row, table_col = _cell(grid, 0.0, 1.7)
+    if grid.logodds[table_row, table_col] > config.occupied_logodds:
+        assert not grid.explored[table_row, table_col]
+
     close = depth_at(0.9)
     assert float(close.min()) > 1.5
     for _ in range(8):
@@ -581,6 +668,7 @@ def main():
     check_bearing()
     check_plan()
     check_frontiers()
+    check_frontier_refresh()
     check_portal_side()
     check_merge()
     check_shared_grid()
