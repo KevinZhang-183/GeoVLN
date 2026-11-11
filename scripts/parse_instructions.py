@@ -109,6 +109,7 @@ ROOM_WORDS = {
     "patio",
     "porch",
     "lounge",
+    "washroom",
 }
 OBJECT_WORDS = {
     "door",
@@ -146,6 +147,7 @@ OBJECT_WORDS = {
     "lamp",
     "mirror",
     "railing",
+    "entrance",
 }
 
 PROMPT = """Split the navigation instruction into steps, in order.
@@ -154,11 +156,25 @@ Each step is {"action": ..., "landmark": ..., "near": ..., "side": ...}.
 action is one of:
 - go_to: walk to, into, through or past the landmark.
 - exit: leave a room. landmark is the room being left, or "" if it is not named.
-- turn_left, turn_right, turn_around: only when the instruction says turn, take a left/right, or turn around. landmark, near and side are "".
+- turn_left, turn_right, turn_around: only when the instruction says turn, take a left/right, or turn around. The turn step itself has landmark, near and side "".
 - stop: only the last step, where the instruction says to stop or wait. "Stand in front of", "face", and "turn to face" are go_to, not stop.
-landmark is the place to reach, in 1 to 3 words: an object, door, doorway or room.
+
+Put the object a turn happens at in the previous step:
+- Turn at, by, or after an object: go_to that object, then the turn. "Take a right at the large clock" is go_to clock, then turn_right.
+- Turn in order to pass or enter something else: the turn comes first. "Turn right to walk past the stairs" is turn_right, then go_to stairs.
+The object the instruction finally stops beside is the stop landmark, even when the last verb is a turn. "Turn right by the island" ends at island.
+
+landmark is the place to reach, in 1 to 4 words: an object, door, doorway or room.
+- "corner of X", "side of X", and "end of X" use landmark X. "corner of the bar" is "bar".
+- Keep first, second, next, leftmost, and rightmost in the landmark. Entering another next room is a second go_to, not a repeated step to drop.
+- Keep a short visual description when it identifies the object. A frame with a bear, balloons, and the word welcome is "welcome frame".
+- Correct obvious spelling. "dinning" is "dining".
 near is another object named only to locate the landmark, else "". In "the doorway by the flower pot", landmark is "doorway" and near is "flower pot".
-side is "left" or "right" when the instruction says which side the landmark is on, else "". "On your left" and "to the right of" set side. They are not turns.
+side is "left" or "right" when the instruction says which side, else "". It is not a turn, and it is not a compass direction.
+- "on your left" sets side and leaves near "".
+- "left of the table" sets side to left and near to "table".
+- "leftmost" and "rightmost" stay in the landmark and do not set side.
+- "behind", "opposite", and "past" do not set side.
 
 Reply with JSON only: {"steps": [...]}
 
@@ -170,6 +186,18 @@ Instruction: Walk down the hallway to the second doorway on your left. Turn left
 
 Instruction: Go through the doorway to the right of the table, then stop at the door by the flower pot.
 {"steps": [{"action": "go_to", "landmark": "doorway", "near": "table", "side": "right"}, {"action": "stop", "landmark": "door", "near": "flower pot", "side": ""}]}
+
+Instruction: Take a right at the large clock, go through the kitchen, and stop at the washroom.
+{"steps": [{"action": "go_to", "landmark": "clock", "near": "", "side": ""}, {"action": "turn_right", "landmark": "", "near": "", "side": ""}, {"action": "go_to", "landmark": "kitchen", "near": "", "side": ""}, {"action": "stop", "landmark": "washroom", "near": "", "side": ""}]}
+
+Instruction: Turn right to walk past the stairs. Stop in front of the door on the right.
+{"steps": [{"action": "turn_right", "landmark": "", "near": "", "side": ""}, {"action": "go_to", "landmark": "stairs", "near": "", "side": ""}, {"action": "stop", "landmark": "door", "near": "", "side": "right"}]}
+
+Instruction: Turn right by the island.
+{"steps": [{"action": "go_to", "landmark": "island", "near": "", "side": ""}, {"action": "turn_right", "landmark": "", "near": "", "side": ""}, {"action": "stop", "landmark": "island", "near": "", "side": ""}]}
+
+Instruction: Head into the next room. Walk forward into the next room. Stop at the next door.
+{"steps": [{"action": "go_to", "landmark": "next room", "near": "", "side": ""}, {"action": "go_to", "landmark": "next room", "near": "", "side": ""}, {"action": "stop", "landmark": "next door", "near": "", "side": ""}]}
 
 Instruction: {instruction}
 """
@@ -226,11 +254,23 @@ def build_prompt(instruction: str, errors: list[str] | None = None) -> str:
     return prompt
 
 
+PARTITIVE = re.compile(r"^(?:corner|side|end)\s+of\s+")
+SPELLING = {"dinning": "dining"}
+
+
 def _landmark(value) -> str:
-    words = str(value or "").lower().replace(",", " ").strip().strip(".").split()
+    words = [SPELLING.get(word, word) for word in str(value or "").lower().replace(",", " ").strip().strip(".").split()]
     while words and words[0] in ARTICLES:
         words = words[1:]
     phrase = " ".join(words)
+    while True:
+        stripped = PARTITIVE.sub("", phrase, count=1)
+        if stripped == phrase:
+            break
+        words = stripped.split()
+        while words and words[0] in ARTICLES:
+            words = words[1:]
+        phrase = " ".join(words)
     return "" if phrase in DIRECTION_ONLY else phrase
 
 
@@ -331,10 +371,10 @@ def validate(parsed: dict) -> tuple[dict | None, list[str], list[str]]:
     deduped = []
     for step in out:
         last = deduped[-1] if deduped else None
-        # 同一类物体可以出现多次，near 或 side 不同就是另一步。只合并紧挨着的同一次到达。
-        if last and step["action"] != "exit" and _same_place(step, last):
-            if step["action"] == "stop":
-                last["action"] = "stop"
+        # 同一类物体可以出现多次。紧挨着的 go_to 再加 stop 是同一次到达。
+        # 两个 go_to 都留下：指令里连续进入两个 next room 不是重复生成。
+        if last and step["action"] == "stop" and _same_place(step, last):
+            last["action"] = "stop"
             continue
         deduped.append(step)
 
@@ -605,6 +645,55 @@ def self_check() -> None:
 
     room, errors, flags = validate({"steps": [{"action": "stop", "landmark": "kitchen"}]})
     assert room is not None and any("stop landmark is a room" in flag for flag in flags)
+
+    corner, errors, _flags = validate({"steps": [{"action": "stop", "landmark": "corner of the bar"}]})
+    assert not errors, errors
+    assert corner["end_landmark"] == "bar"
+    side_of, errors, _flags = validate({"steps": [{"action": "stop", "landmark": "side of the bed"}]})
+    assert side_of["end_landmark"] == "bed"
+    end_of, errors, _flags = validate({"steps": [{"action": "go_to", "landmark": "end of the hallway"}]})
+    assert end_of["subtasks"][0]["landmark"] == "hallway"
+
+    repeated, errors, _flags = validate(
+        {
+            "steps": [
+                {"action": "go_to", "landmark": "next room"},
+                {"action": "go_to", "landmark": "next room"},
+                {"action": "stop", "landmark": "next door"},
+            ]
+        }
+    )
+    assert not errors, errors
+    assert [(step["action"], step["landmark"]) for step in repeated["subtasks"]] == [
+        ("go_to", "next room"),
+        ("go_to", "next room"),
+        ("stop", "next door"),
+    ]
+
+    at_clock, errors, flags = validate(
+        {
+            "steps": [
+                {"action": "turn_right", "landmark": "clock"},
+                {"action": "stop", "landmark": "washroom"},
+            ]
+        }
+    )
+    assert not errors, errors
+    assert [(step["action"], step["landmark"]) for step in at_clock["subtasks"]] == [
+        ("go_to", "clock"),
+        ("turn_right", ""),
+        ("stop", "washroom"),
+    ]
+    assert any("stop landmark is a room: washroom" in flag for flag in flags)
+
+    entrance, errors, flags = validate({"steps": [{"action": "stop", "landmark": "kitchen entrance"}]})
+    assert not errors, errors
+    assert entrance["end_landmark"] == "kitchen entrance"
+    assert not any("room" in flag for flag in flags)
+
+    spelling, errors, _flags = validate({"steps": [{"action": "stop", "landmark": "dinning room table"}]})
+    assert not errors, errors
+    assert spelling["end_landmark"] == "dining room table"
 
     blocked, errors, _flags = validate({"steps": [{"action": "go_to", "landmark": "left"}]})
     assert blocked is None and any("no step has a landmark" in error for error in errors)
