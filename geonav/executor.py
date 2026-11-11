@@ -9,13 +9,17 @@ from geonav.geom import INFLATE_M, bearing_deg, block_ahead, heading_error_deg, 
 FORWARD = "move_forward"
 LEFT = "turn_left"
 RIGHT = "turn_right"
+# One simulator turn is 15 degrees. Ten degrees never stays inside the window
+# while the door normal is refit, so arrival accepts a heading within 30.
+ALIGN_DEG = 30.0
 
 
 class Executor:
-    def __init__(self, inflate_m=INFLATE_M, lookahead_m=0.6, turn_deg=10.0):
+    def __init__(self, inflate_m=INFLATE_M, lookahead_m=0.6, turn_deg=10.0, align_deg=ALIGN_DEG):
         self.inflate_m = inflate_m
         self.lookahead_m = lookahead_m
         self.turn_deg = turn_deg
+        self.align_deg = align_deg
         self.waypoint = None
         self.stage = 0
         self.path = []
@@ -23,6 +27,8 @@ class Executor:
         self.stuck_count = 0
         self.abandoned = False
         self.reached = False
+        self._align_heading = None
+        self._align_stage = None
 
     def clear(self):
         self.waypoint = None
@@ -32,6 +38,8 @@ class Executor:
         self.stuck_count = 0
         self.abandoned = False
         self.reached = False
+        self._align_heading = None
+        self._align_stage = None
 
     def set_waypoint(self, waypoint):
         if waypoint is None:
@@ -39,7 +47,11 @@ class Executor:
             return
         if self.waypoint is not None and self.waypoint.name == waypoint.name and not self.abandoned:
             self.waypoint = waypoint
-            self.stage = min(self.stage, len(waypoint.stages) - 1)
+            stage = min(self.stage, len(waypoint.stages) - 1)
+            if stage != self.stage:
+                self._align_heading = None
+                self._align_stage = None
+                self.stage = stage
             return
         self.waypoint = waypoint
         self.stage = 0
@@ -48,6 +60,8 @@ class Executor:
         self.stuck_count = 0
         self.abandoned = False
         self.reached = False
+        self._align_heading = None
+        self._align_stage = None
 
     def target(self):
         if self.waypoint is None or self.stage >= len(self.waypoint.stages):
@@ -64,8 +78,10 @@ class Executor:
             return None
         agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
         if float(np.hypot(agent[0] - target.xz[0], agent[1] - target.xz[1])) <= target.radius:
-            if target.heading is not None and abs(heading_error_deg(pose, target.heading)) > self.turn_deg:
-                return _turn(heading_error_deg(pose, target.heading))
+            if target.heading is not None and not self._heading_ok(pose, target):
+                return _turn(heading_error_deg(pose, self._align_heading))
+            self._align_heading = None
+            self._align_stage = None
             self.stage += 1
             self._forwards = []
             self.stuck_count = 0
@@ -104,6 +120,17 @@ class Executor:
             return _turn(error)
         self._forwards.append(agent.copy())
         return FORWARD
+
+    def _heading_ok(self, pose, target):
+        """Face the heading this stage had when the agent arrived.
+
+        The portal normal is refit every frame. Chasing that moving direction
+        turns in place and never steps through the door.
+        """
+        if self._align_stage != self.stage or self._align_heading is None:
+            self._align_heading = np.array(target.heading, dtype=np.float64, copy=True)
+            self._align_stage = self.stage
+        return abs(heading_error_deg(pose, self._align_heading)) <= self.align_deg
 
     def _stuck(self, agent):
         if len(self._forwards) < 5:

@@ -149,6 +149,43 @@ def check_frontier_refresh():
     assert watched.refreshes == 1, watched.refreshes
 
 
+def check_align():
+    """Arrival accepts 30 degrees and does not chase a door normal that keeps moving."""
+    from geonav.waypoints import point_waypoint
+
+    grid = make_grid()
+    pose = pose_at(0.0, 0.0, (0.0, 1.0))
+    near = point_waypoint("P9", [0.0, 0.0], radius=0.5, heading=_rotated((0.0, 1.0), 20.0))
+    executor = Executor()
+    executor.set_waypoint(near)
+    assert executor.act(pose, grid) is None and executor.reached
+
+    pose = pose_at(0.0, 0.0, (0.0, 1.0))
+    waypoint = point_waypoint("P9", [0.0, 0.0], radius=0.5, heading=_rotated((0.0, 1.0), 45.0))
+    executor = Executor()
+    executor.set_waypoint(waypoint)
+    turns = 0
+    for _ in range(24):
+        action = executor.act(pose, grid)
+        if executor.reached:
+            break
+        assert action in ("turn_left", "turn_right")
+        pose = _turned(pose, action)
+        turns += 1
+        waypoint.stages[0].heading = _rotated(-pose[[0, 2], 2], 45.0)
+        executor.set_waypoint(waypoint)
+    assert executor.reached, "a moving door heading should not spin out the step budget"
+    assert turns <= 12, turns
+
+
+def _rotated(forward, degrees):
+    forward = np.asarray(forward, dtype=np.float64)
+    forward = forward / np.linalg.norm(forward)
+    right = np.array([-forward[1], forward[0]])
+    angle = np.deg2rad(degrees)
+    return forward * np.cos(angle) + right * np.sin(angle)
+
+
 def check_stuck():
     grid = make_grid()
     pose = pose_at(0.0, 0.0, (0.0, 1.0))
@@ -703,6 +740,7 @@ def main():
     check_portal_side()
     check_merge()
     check_shared_grid()
+    check_align()
     check_stuck()
     check_landmark_policy()
     check_goal_stop()
