@@ -42,7 +42,7 @@ STATE_COLORS = {
 UNDRAWN = ("invalid", "explored")
 ACTIVE = ("candidate", "confirmed")
 # Rejections that mean the span is not a door at all, so crossing it is not a traversal.
-NOT_A_DOOR = ("wide", "oblique")
+NOT_A_DOOR = ("wide", "oblique", "slim")
 
 
 @dataclass
@@ -69,8 +69,9 @@ class MapConfig:
     merge_dist_m: float = 0.70
     merge_endpoint_m: float = 0.35
     merge_overlap_m: float = 0.15
-    partial_max_m: float = 2.5
-    max_portal_m: float = 2.5
+    partial_max_m: float = 2.2
+    min_portal_m: float = 0.8
+    max_portal_m: float = 2.2
     jamb_reach_m: float = 0.30
     jamb_align_deg: float = 40.0
     # Cone around the segment when deciding whether an end actually runs into a wall.
@@ -816,16 +817,17 @@ class PortalMap:
     def _reject_reason(self, tr):
         """Empty when the opening may stay a portal.
 
-        Otherwise ``wide``, ``oblique``, ``jamb``, ``side``, or ``narrow``.
-        A side view is straightened onto the jamb-to-jamb line before the other
-        checks, so the normal points through the doorway.
+        Otherwise ``wide``, ``oblique``, ``jamb``, ``side``, ``narrow``, or
+        ``slim`` for a span under ``min_portal_m``. A side view is straightened
+        onto the jamb-to-jamb line before the other checks, so the normal points
+        through the doorway.
         """
         if tr.abandoned:
             return ""
         if tr.width > self.config.max_portal_m:
             return "wide"
         if self.grid is None or self.pose is None:
-            return ""
+            return "slim" if tr.width < self.config.min_portal_m else ""
         aligned = self._align_to_jambs(tr)
         if aligned in ("wide", "oblique", "jamb"):
             return aligned
@@ -833,6 +835,8 @@ class PortalMap:
             return "side"
         if self._not_narrowest(tr):
             return "narrow"
+        if tr.width < self.config.min_portal_m:
+            return "slim"
         return ""
 
     def _align_to_jambs(self, tr):

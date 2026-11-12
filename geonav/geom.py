@@ -136,6 +136,49 @@ def frontiers(
     return found
 
 
+def unknown_beyond(grid, center, outward, half_width, radius_m=FRONTIER_GAIN_M):
+    """Square meters of unknown space reached through a doorway, on its ``outward`` side."""
+    explored = getattr(grid, "explored", None)
+    if grid is None or explored is None:
+        return 0.0
+    normal = np.asarray(outward, dtype=np.float64)
+    norm = float(np.linalg.norm(normal))
+    if norm < 1e-9:
+        return 0.0
+    normal = normal / norm
+    across = np.array([-normal[1], normal[0]])
+    center = np.asarray(center, dtype=np.float64)
+    depths = np.arange(0.1, 1.0 + 1e-6, grid.res)
+    offsets = np.linspace(-half_width, half_width, 7)
+    seeds_xz = np.array([center + normal * d + across * s for d in depths for s in offsets])
+    rows, cols, ok = grid.cells(seeds_xz)
+    occupied = grid.logodds > grid.config.occupied_logodds
+    unknown = ~explored & ~occupied
+    middle = grid.cells(center[None, :])
+    if not bool(middle[2][0]):
+        return 0.0
+    cells = [(int(r), int(c)) for r, c, good in zip(rows, cols, ok) if good and unknown[int(r), int(c)]]
+    if not cells:
+        return 0.0
+    row0, col0 = int(middle[0][0]), int(middle[1][0])
+    reach = int(math.ceil(radius_m / max(grid.res, 1e-6)))
+    rr = slice(max(0, row0 - reach), min(unknown.shape[0], row0 + reach + 1))
+    cc = slice(max(0, col0 - reach), min(unknown.shape[1], col0 + reach + 1))
+    labels, _ = ndimage.label(unknown[rr, cc], structure=np.ones((3, 3), dtype=bool))
+    seeds = {int(labels[r - rr.start, c - cc.start]) for r, c in cells
+             if 0 <= r - rr.start < labels.shape[0] and 0 <= c - cc.start < labels.shape[1]}
+    seeds.discard(0)
+    if not seeds:
+        return 0.0
+    gr, gc = np.ogrid[rr.start:rr.stop, cc.start:cc.stop]
+    xs = grid.origin[0] + (gc + 0.5) * grid.res
+    zs = grid.origin[1] + (gr + 0.5) * grid.res
+    ahead = (xs - center[0]) * normal[0] + (zs - center[1]) * normal[1] > 0.0
+    disk = (gr - row0) ** 2 + (gc - col0) ** 2 <= reach * reach
+    joined = np.isin(labels, list(seeds)) & disk & ahead
+    return float(joined.sum()) * grid.res * grid.res
+
+
 def _unknown_area(grid, unknown, cells, middle, radius_m):
     """Square meters of unknown cells joined to ``cells`` within ``radius_m`` of ``middle``."""
     reach = int(math.ceil(radius_m / max(grid.res, 1e-6)))

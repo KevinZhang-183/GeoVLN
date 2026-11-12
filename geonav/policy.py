@@ -11,7 +11,7 @@ install()
 from parse_instructions import _landmark, _place_only  # noqa: E402
 from portal_map import NOT_A_DOOR, _agent_axes  # noqa: E402
 
-from geonav.geom import bearing_deg, plan  # noqa: E402
+from geonav.geom import bearing_deg, plan, unknown_beyond  # noqa: E402
 from geonav.waypoints import Waypoint, landmark_waypoint, point_waypoint, portal_waypoint, stand_point  # noqa: E402
 from geonav.world import _is_door  # noqa: E402
 
@@ -30,6 +30,15 @@ MIN_STOP_TRAVEL_M = 3.0
 FALLBACK_STEPS = 80
 # Keeps a frontier at the agent's feet from scoring without bound.
 FRONTIER_D0 = 1.0
+# A doorway opens a new space however little of it is visible yet, so it earns
+# area on top of what lies behind it. Widths near 1.5 m earn the most.
+DOOR_BONUS_CONFIRMED = 4.0
+DOOR_BONUS_CANDIDATE = 2.0
+DOOR_WIDTH_BEST = 1.5
+DOOR_WIDTH_SIGMA = 0.5
+# After a look, the locked door gives way only to a target this many times better.
+SWITCH_RATIO = 1.5
+WRONG_SIDE = 0.25
 ROOM_DEPTH_M = 1.5
 ROOM_RADIUS_M = 4.0
 ROOM_ANCHORS = {
@@ -94,6 +103,7 @@ class Policy:
         self.fallback = False
         self.room_rejected = False
         self.score_log = []
+        self.recheck = False
 
     def prompts(self):
         """Phrases for SAM3. Goal follows the dataset point and does not build landmarks."""
@@ -135,23 +145,29 @@ class Policy:
             return Decision("waypoint", waypoint=self.lock, reason=self.lock.name)
         if self.lock is not None and self._lock_ok(world):
             if self._approach_due(world, self.lock, pose):
-                self.lock = None
+                # The door stays locked through the look, so a door off to the side cannot take over.
                 return Decision("look", reason="approach")
+            if self.recheck:
+                self.recheck = False
+                better = self._better_than_lock(world, pose)
+                if better is not None:
+                    self.lock = better
             return Decision("waypoint", waypoint=self.lock, reason=self.lock.name)
+        self.recheck = False
         choice = self._choose(world, pose)
         if choice is not None:
-            if self._approach_due(world, choice, pose):
-                return Decision("look", reason="approach")
             self.lock = choice
             self.did_backtrack = False
+            if self._approach_due(world, choice, pose):
+                return Decision("look", reason="approach")
             return Decision("waypoint", waypoint=choice, reason=choice.name)
         if self.allow_look:
             # Walk through the doorway ahead and survey once inside.
             door = self._explored_ahead(world, pose)
             if door is not None:
+                self.lock = door
                 if self._approach_due(world, door, pose):
                     return Decision("look", reason="approach")
-                self.lock = door
                 self.did_backtrack = False
                 return Decision("waypoint", waypoint=door, reason=door.name)
             return Decision("look", reason="no candidate")
@@ -164,6 +180,27 @@ class Policy:
 
     def note_look(self, xz):
         self.looks.append(np.asarray(xz, dtype=np.float64).copy())
+        self.recheck = True
+
+    def _better_than_lock(self, world, pose):
+        """A target worth leaving the locked door for, or None. Door steps only weigh other doors."""
+        if self.lock is None or not str(self.lock.name).startswith("P"):
+            return None
+        track = world.portals.track(self.lock.portal_id)
+        if track is None:
+            return None
+        agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
+        current = self._portal_utility(world, track, agent, pose, self._step_side())
+        held = 0.0 if current is None else current[0]
+        others = [item for item in self._rank_portals(world, pose, None, self._step_side()) if item[3].id != track.id]
+        if not self._door_step():
+            others += self._rank_frontiers(world, pose)
+        if not others:
+            return None
+        best = max(others, key=lambda item: item[0])
+        if best[0] >= SWITCH_RATIO * max(held, 1e-6):
+            return best[2]
+        return None
 
     def _approach_due(self, world, waypoint, pose):
         """Look once when the agent is already within 2 m of an unsurveyed door.
@@ -228,10 +265,38 @@ class Policy:
                 choice = self._door_choice(world, pose, current)
                 if choice is not None:
                     return choice
-        portal = self._best_portal(world, pose, None, "")
-        if portal is not None:
-            return portal
-        return self._best_frontier(world, pose)
+        portals = self._rank_portals(world, pose, None, "")
+        frontiers = self._rank_frontiers(world, pose)
+        pool = sorted(portals + frontiers, key=lambda item: (round(item[0], 2), item[1]), reverse=True)
+        if not pool:
+            return None
+        self._log(pool[0][2], portals, frontiers)
+        return pool[0][2]
+
+    def _door_step(self):
+        current = self._current() if self.mode == "landmark" else None
+        if current is None:
+            return False
+        landmark = current.get("landmark") or ""
+        return current["action"] == "exit" or _place_only(landmark) or _is_door(landmark)
+
+    def _step_side(self):
+        current = self._current() if self.mode == "landmark" else None
+        return "" if current is None else current.get("side") or ""
+
+    def _log(self, chosen, portals, frontiers):
+        self.score_log.append({
+            "step": self.step,
+            "chosen": chosen.name,
+            "portals": [
+                {"id": item[3].id, "area_m2": round(item[4], 2), "path_m": round(item[5], 2), "utility": round(item[0], 3)}
+                for item in portals
+            ],
+            "frontiers": [
+                {"id": item[3].id, "area_m2": round(item[4], 2), "path_m": round(item[5], 2), "utility": round(item[0], 3)}
+                for item in frontiers
+            ],
+        })
 
     def _door_choice(self, world, pose, step):
         linked = []
@@ -414,6 +479,14 @@ class Policy:
         return waypoint
 
     def _best_portal(self, world, pose, restrict, side):
+        ranked = self._rank_portals(world, pose, restrict, side)
+        if not ranked:
+            return None
+        self._log(ranked[0][2], ranked, [])
+        return ranked[0][2]
+
+    def _rank_portals(self, world, pose, restrict, side):
+        """``(utility, align, waypoint, track, area, path)`` for each reachable active door, best first."""
         agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
         ranked = []
         for track in world.active_portals():
@@ -421,19 +494,36 @@ class Policy:
                 continue
             if self._banned(track.center):
                 continue
-            waypoint = portal_waypoint(track, agent)
-            if world.grid is not None and plan(world.grid, agent, waypoint.stages[0].xz, snap_m=0.8) is None:
-                continue
-            ranked.append((self._score(track.center, pose, track.state == "confirmed", side), waypoint))
-        if not ranked:
-            return None
-        ranked.sort(key=lambda item: item[0])
-        return ranked[0][1]
+            scored = self._portal_utility(world, track, agent, pose, side)
+            if scored is not None:
+                ranked.append(scored)
+        ranked.sort(key=lambda item: (round(item[0], 2), item[1]), reverse=True)
+        return ranked
 
-    def _best_frontier(self, world, pose):
-        """Most unknown area per meter of path. Heading only breaks near ties."""
+    def _portal_utility(self, world, track, agent, pose, side):
+        waypoint = portal_waypoint(track, agent)
+        route = None
+        if world.grid is not None:
+            route = plan(world.grid, agent, waypoint.stages[0].xz, snap_m=0.8)
+            if route is None:
+                return None
+        length = _route_length(agent, route, waypoint.stages[0].xz)
+        center = np.asarray(track.center, dtype=np.float64)
+        normal = np.asarray(track.normal, dtype=np.float64)
+        toward_agent = 1.0 if float((agent - center) @ normal) > 0.0 else -1.0
+        width = float(getattr(track, "width", DOOR_WIDTH_BEST))
+        area = 0.0
+        if world.grid is not None:
+            area = unknown_beyond(world.grid, center, -toward_agent * normal, width / 2.0)
+        bonus = {"confirmed": DOOR_BONUS_CONFIRMED, "candidate": DOOR_BONUS_CANDIDATE}.get(track.state, 0.0)
+        utility = (area + bonus * door_width_weight(width)) / (length + FRONTIER_D0)
+        if not _side_ok_xz(center, pose, side):
+            utility *= WRONG_SIDE
+        return utility, self._align(center, agent, pose), waypoint, track, area, length
+
+    def _rank_frontiers(self, world, pose):
+        """Most unknown area per meter of path first. Heading only breaks near ties."""
         agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
-        forward = self.prior if self.prior is not None else _agent_axes(pose)[0]
         ranked = []
         for frontier in world.frontiers:
             if self._banned(frontier.xz):
@@ -446,39 +536,16 @@ class Policy:
             length = _route_length(agent, route, frontier.xz)
             area = float(getattr(frontier, "area", 0.0))
             utility = area / (length + FRONTIER_D0)
-            delta = np.asarray(frontier.xz, dtype=np.float64) - agent
-            dist = float(np.linalg.norm(delta))
-            align = 0.0 if dist < 1e-6 else float(np.dot(delta / dist, forward))
-            ranked.append((round(utility, 2), align, frontier, length, area, utility))
-        if not ranked:
-            return None
-        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        best = ranked[0][2]
-        self.score_log.append({
-            "step": self.step,
-            "chosen": f"F{best.id}",
-            "frontiers": [
-                {"id": item[2].id, "area_m2": round(item[4], 2), "path_m": round(item[3], 2), "utility": round(item[5], 3)}
-                for item in ranked
-            ],
-        })
-        return point_waypoint(f"F{best.id}", best.xz, radius=0.6, snap_m=0.8)
+            waypoint = point_waypoint(f"F{frontier.id}", frontier.xz, radius=0.6, snap_m=0.8)
+            ranked.append((utility, self._align(frontier.xz, agent, pose), waypoint, frontier, area, length))
+        ranked.sort(key=lambda item: (round(item[0], 2), item[1]), reverse=True)
+        return ranked
 
-    def _score(self, xz, pose, confirmed, side):
-        agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
+    def _align(self, xz, agent, pose):
+        forward = self.prior if self.prior is not None else _agent_axes(pose)[0]
         delta = np.asarray(xz, dtype=np.float64) - agent
         dist = float(np.linalg.norm(delta))
-        forward = self.prior if self.prior is not None else _agent_axes(pose)[0]
-        align = 0.0 if dist < 1e-6 else float(np.dot(delta / dist, forward))
-        score = dist - 2.0 * align
-        if confirmed:
-            score -= 1.0
-        bearing = bearing_deg(pose, xz)
-        if side == "left" and bearing > 15.0:
-            score += 3.0
-        if side == "right" and bearing < -15.0:
-            score += 3.0
-        return score
+        return 0.0 if dist < 1e-6 else float(np.dot(delta / dist, forward))
 
     def _lock_ok(self, world):
         name = self.lock.name
@@ -677,6 +744,18 @@ def room_point(grid, door_center, inward, radius=ROOM_RADIUS_M, depth=ROOM_DEPTH
         target = center + normal * depth
     nearest = int(np.argmin(np.hypot(inside[:, 0] - target[0], inside[:, 1] - target[1])))
     return inside[nearest].copy()
+
+
+def door_width_weight(width):
+    """1 at 1.5 m, falling off as a Gaussian toward the 0.8 m and 2.2 m limits."""
+    return float(np.exp(-((float(width) - DOOR_WIDTH_BEST) ** 2) / (2.0 * DOOR_WIDTH_SIGMA ** 2)))
+
+
+def _side_ok_xz(xz, pose, side):
+    if side not in ("left", "right"):
+        return True
+    bearing = bearing_deg(pose, xz)
+    return bearing <= 15.0 if side == "left" else bearing >= -15.0
 
 
 def _route_length(agent, route, goal):

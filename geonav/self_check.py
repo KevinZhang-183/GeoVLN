@@ -426,6 +426,42 @@ def check_frontier_choice():
     assert policy.score_log and policy.score_log[-1]["chosen"] == "F2"
 
 
+def check_door_choice():
+    """Door widths, and a door locked before its approach look that a side door cannot steal."""
+    from geonav.policy import door_width_weight
+
+    assert abs(door_width_weight(1.5) - 1.0) < 1e-9
+    assert 0.3 < door_width_weight(0.8) < 0.45 and 0.3 < door_width_weight(2.2) < 0.45
+    assert PortalMap(MapConfig())._reject_reason(_opening(12, [-0.35, 0.0], [0.35, 0.0])) == "slim"
+
+    front = _Track(1, [0.0, 1.5], [0.0, 1.0], "confirmed")
+    front.width = 1.5
+    side = _Track(2, [1.6, 0.4], [1.0, 0.0], "candidate")
+    side.width = 2.2
+    world = _FakeWorld(make_grid())
+    world.portals.tracks += [front, side]
+    world.active_portals = lambda: [front, side]
+    parsed = {"end_landmark": "chair", "subtasks": [{"id": 1, "action": "go_to", "landmark": "chair", "near": "", "side": ""}]}
+    policy = Policy("landmark", parsed, None, allow_look=True)
+    origin = pose_at(0.0, 0.0, (0.0, 1.0))
+    looking = policy.decide(world, origin, 0)
+    assert looking.kind == "look" and looking.reason == "approach", looking.reason
+    assert policy.lock is not None and policy.lock.name == "P1"
+
+    # The look reveals a better side door, but not 1.5 times better: keep the door in front.
+    side.state, side.width, side.center = "confirmed", 1.5, np.array([1.0, 0.2])
+    policy.note_look(origin[[0, 2], 3])
+    facing_side = pose_at(0.0, 0.0, (1.0, 0.0))
+    kept = policy.decide(world, facing_side, 1)
+    assert kept.kind == "waypoint" and kept.waypoint.name == "P1", kept.reason
+
+    # Once the front door turns out much worse, the next look lets the side door win.
+    front.state, front.width = "candidate", 2.2
+    policy.note_look(origin[[0, 2], 3])
+    switched = policy.decide(world, facing_side, 2)
+    assert switched.kind == "waypoint" and switched.waypoint.name == "P2", switched.reason
+
+
 def check_goal_stop():
     grid = make_grid()
     world = _FakeWorld(grid)
@@ -768,8 +804,9 @@ def _door_map():
 
 
 def check_portal_geometry():
-    assert PortalConfig().max_width_m == 2.5
-    assert PortalConfig().edge_max_width_m == 2.5
+    assert PortalConfig().max_width_m == 2.2
+    assert PortalConfig().edge_max_width_m == 2.2
+    assert MapConfig().min_portal_m == 0.8 and MapConfig().max_portal_m == 2.2
     portal_map = _door_map()
     door = _opening(1, [-0.45, 0.0], [0.45, 0.0])
     portal_map.tracks = [door]
@@ -903,6 +940,7 @@ def main():
     check_landmark_policy()
     check_stop_rules()
     check_frontier_choice()
+    check_door_choice()
     check_goal_stop()
     check_look_budget()
     check_explored_door()

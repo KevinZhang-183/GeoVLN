@@ -29,9 +29,10 @@ class PortalConfig:
     depth_min: float = 0.2
     depth_max: float = 10.0
     near_jamb_m: float = 0.8
-    min_width_m: float = 0.40
-    max_width_m: float = 2.5
-    edge_max_width_m: float = 2.5
+    # A single view may see only part of a door; the 0.8 m floor applies to the fused track.
+    min_width_m: float = 0.60
+    max_width_m: float = 2.2
+    edge_max_width_m: float = 2.2
     squat_min_width_m: float = 1.5
     min_aspect: float = 1.25
     rise_m: float = 1.35
