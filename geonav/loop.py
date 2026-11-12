@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from geonav.policy import Policy
 from geonav.sam3_client import Sam3Client
 from geonav.video import clear_vis, vis_video_name, write_vis_video
 from geonav.world import World
+from parse_instructions import fill_along  # noqa: E402
 from portal_map import _agent_axes  # noqa: E402
 
 LOOK_TURNS = 24
@@ -113,7 +115,7 @@ def run_one(env, episode, row, args, client):
     env.current_episode = episode
     observation = env.reset()
     goal = _goal(episode)
-    parsed = row.get("parsed")
+    parsed = fill_along(copy.deepcopy(row.get("parsed")), row.get("instruction") or "")
     mode = args.mode
     if mode == "landmark" and not parsed:
         print(f"  {episode.episode_id} 没有解析结果，这一条按 explore 走", flush=True)

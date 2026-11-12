@@ -38,7 +38,11 @@ DOOR_WIDTH_BEST = 1.5
 DOOR_WIDTH_SIGMA = 0.5
 # After a look, the locked door gives way only to a target this many times better.
 SWITCH_RATIO = 1.5
-WRONG_SIDE = 0.25
+# An along object must sit beside the walk to a candidate: within this far past
+# either end of it, and at least this far to the named side.
+ALONG_SLACK_M = 1.0
+ALONG_LATERAL_M = 0.3
+SIDE_SLACK_DEG = 15.0
 ROOM_DEPTH_M = 1.5
 ROOM_RADIUS_M = 4.0
 ROOM_ANCHORS = {
@@ -104,6 +108,7 @@ class Policy:
         self.room_rejected = False
         self.score_log = []
         self.recheck = False
+        self.step_heading = None
 
     def prompts(self):
         """Phrases for SAM3. Goal follows the dataset point and does not build landmarks."""
@@ -190,9 +195,9 @@ class Policy:
         if track is None:
             return None
         agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
-        current = self._portal_utility(world, track, agent, pose, self._step_side())
+        current = self._portal_utility(world, track, agent, pose)
         held = 0.0 if current is None else current[0]
-        others = [item for item in self._rank_portals(world, pose, None, self._step_side()) if item[3].id != track.id]
+        others = [item for item in self._rank_portals(world, pose, None) if item[3].id != track.id]
         if not self._door_step():
             others += self._rank_frontiers(world, pose)
         if not others:
@@ -265,8 +270,11 @@ class Policy:
                 choice = self._door_choice(world, pose, current)
                 if choice is not None:
                     return choice
-        portals = self._rank_portals(world, pose, None, "")
+        portals = self._rank_portals(world, pose, None)
         frontiers = self._rank_frontiers(world, pose)
+        if not portals and not frontiers and self._along_ref(world, pose) is not None:
+            # Keep exploring, but never through a door that puts the along object on the wrong side.
+            frontiers = self._rank_frontiers(world, pose, gate=False)
         pool = sorted(portals + frontiers, key=lambda item: (round(item[0], 2), item[1]), reverse=True)
         if not pool:
             return None
@@ -283,6 +291,39 @@ class Policy:
     def _step_side(self):
         current = self._current() if self.mode == "landmark" else None
         return "" if current is None else current.get("side") or ""
+
+    def _door_side(self):
+        """``side`` names the door only on door steps; elsewhere it describes the object."""
+        return self._step_side() if self._door_step() else ""
+
+    def _sided(self, xz, pose, side):
+        """Left or right of the heading this step started with, so a look does not flip it."""
+        if side not in ("left", "right"):
+            return True
+        agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
+        forward = self.step_heading if self.step_heading is not None else _agent_axes(pose)[0]
+        return side_of(xz, agent, forward, side)
+
+    def _along_ref(self, world, pose):
+        """The confirmed along object of this step, or None when the step has none or it is unseen."""
+        current = self._current() if self.mode == "landmark" else None
+        if current is None or not current.get("along") or current.get("along_side") not in ("left", "right"):
+            return None
+        labels = _labels(current["along"])
+        need = world.semantic.config.confirm_hits
+        pool = [item for item in world.semantic.instances if item.label in labels and item.hits >= need]
+        if not pool:
+            return None
+        agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
+        pool.sort(key=lambda item: float(np.hypot(item.x - agent[0], item.z - agent[1])))
+        return np.array([pool[0].x, pool[0].z], dtype=np.float64)
+
+    def _along_pass(self, world, pose, target, ref=None):
+        ref = self._along_ref(world, pose) if ref is None else ref
+        if ref is None:
+            return True
+        agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
+        return along_ok(ref, agent, target, self._current()["along_side"])
 
     def _log(self, chosen, portals, frontiers):
         self.score_log.append({
@@ -442,8 +483,9 @@ class Policy:
         if not matches:
             return None
         side = step.get("side") or ""
-        sided = [item for item in matches if _side_ok(item, pose, side)]
-        pool = sided or matches
+        pool = [item for item in matches if self._sided([item.x, item.z], pose, side)]
+        if not pool:
+            return None
         agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
         pool.sort(key=lambda item: float(np.hypot(item.x - agent[0], item.z - agent[1])))
         return pool[0]
@@ -468,6 +510,8 @@ class Policy:
                 continue
             if abs(bearing_deg(pose, track.center)) > 75.0:
                 continue
+            if not self._along_pass(world, pose, track.center):
+                continue
             dist = float(np.hypot(track.center[0] - agent[0], track.center[1] - agent[1]))
             if dist < best_dist:
                 best, best_dist = track, dist
@@ -485,22 +529,29 @@ class Policy:
         self._log(ranked[0][2], ranked, [])
         return ranked[0][2]
 
-    def _rank_portals(self, world, pose, restrict, side):
-        """``(utility, align, waypoint, track, area, path)`` for each reachable active door, best first."""
+    def _rank_portals(self, world, pose, restrict, side=None):
+        """``(utility, align, waypoint, track, area, path)`` for each allowed reachable door, best first.
+
+        A door on the wrong side, or one whose walk leaves the along object on
+        the wrong side, is not a candidate at all.
+        """
+        side = self._door_side() if side is None else side
         agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
+        ref = self._along_ref(world, pose)
         ranked = []
         for track in world.active_portals():
             if restrict is not None and track.id not in restrict:
                 continue
-            if self._banned(track.center):
+            if self._banned(track.center) or not self._sided(track.center, pose, side):
                 continue
-            scored = self._portal_utility(world, track, agent, pose, side)
-            if scored is not None:
-                ranked.append(scored)
+            scored = self._portal_utility(world, track, agent, pose)
+            if scored is None or not self._along_pass(world, pose, scored[2].stages[-1].xz, ref):
+                continue
+            ranked.append(scored)
         ranked.sort(key=lambda item: (round(item[0], 2), item[1]), reverse=True)
         return ranked
 
-    def _portal_utility(self, world, track, agent, pose, side):
+    def _portal_utility(self, world, track, agent, pose):
         waypoint = portal_waypoint(track, agent)
         route = None
         if world.grid is not None:
@@ -517,16 +568,17 @@ class Policy:
             area = unknown_beyond(world.grid, center, -toward_agent * normal, width / 2.0)
         bonus = {"confirmed": DOOR_BONUS_CONFIRMED, "candidate": DOOR_BONUS_CANDIDATE}.get(track.state, 0.0)
         utility = (area + bonus * door_width_weight(width)) / (length + FRONTIER_D0)
-        if not _side_ok_xz(center, pose, side):
-            utility *= WRONG_SIDE
         return utility, self._align(center, agent, pose), waypoint, track, area, length
 
-    def _rank_frontiers(self, world, pose):
+    def _rank_frontiers(self, world, pose, gate=True):
         """Most unknown area per meter of path first. Heading only breaks near ties."""
         agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
+        ref = self._along_ref(world, pose) if gate else None
         ranked = []
         for frontier in world.frontiers:
             if self._banned(frontier.xz):
+                continue
+            if ref is not None and not self._along_pass(world, pose, frontier.xz, ref):
                 continue
             route = None
             if world.grid is not None:
@@ -655,6 +707,7 @@ class Policy:
         self.start_step = self.step
         self.traveled = 0.0
         self.last_xz = np.asarray(pose, dtype=np.float64)[[0, 2], 3].copy()
+        self.step_heading = np.asarray(_agent_axes(pose)[0], dtype=np.float64).copy()
 
     def _move(self, pose, step):
         self.step = int(step)
@@ -751,11 +804,33 @@ def door_width_weight(width):
     return float(np.exp(-((float(width) - DOOR_WIDTH_BEST) ** 2) / (2.0 * DOOR_WIDTH_SIGMA ** 2)))
 
 
-def _side_ok_xz(xz, pose, side):
-    if side not in ("left", "right"):
-        return True
-    bearing = bearing_deg(pose, xz)
-    return bearing <= 15.0 if side == "left" else bearing >= -15.0
+def side_of(xz, agent, forward, side, slack_deg=SIDE_SLACK_DEG):
+    """True when ``xz`` is on ``side`` of ``forward`` seen from ``agent``, allowing ``slack_deg`` past straight ahead."""
+    forward = np.asarray(forward, dtype=np.float64)
+    right = np.array([-forward[1], forward[0]])
+    delta = np.asarray(xz, dtype=np.float64) - np.asarray(agent, dtype=np.float64)
+    bearing = float(np.degrees(np.arctan2(delta @ right, delta @ forward)))
+    return bearing <= slack_deg if side == "left" else bearing >= -slack_deg
+
+
+def along_ok(ref, agent, target, side):
+    """True when ``ref`` sits beside the walk from ``agent`` to ``target`` on ``side``.
+
+    The walk direction is the forward axis. ``ref`` must project within
+    ``ALONG_SLACK_M`` of the segment and lie at least ``ALONG_LATERAL_M`` to the side.
+    """
+    agent = np.asarray(agent, dtype=np.float64)
+    walk = np.asarray(target, dtype=np.float64) - agent
+    length = float(np.linalg.norm(walk))
+    if length < 1e-6:
+        return False
+    walk = walk / length
+    delta = np.asarray(ref, dtype=np.float64) - agent
+    ahead = float(delta @ walk)
+    if ahead < -ALONG_SLACK_M or ahead > length + ALONG_SLACK_M:
+        return False
+    lateral = float(delta @ np.array([-walk[1], walk[0]]))
+    return lateral <= -ALONG_LATERAL_M if side == "left" else lateral >= ALONG_LATERAL_M
 
 
 def _route_length(agent, route, goal):
@@ -790,12 +865,3 @@ def _near_look(looks, xz, radius):
         if float(np.hypot(item[0] - point[0], item[1] - point[1])) <= radius:
             return True
     return False
-
-
-def _side_ok(instance, pose, side):
-    if side not in ("left", "right"):
-        return True
-    bearing = bearing_deg(pose, [instance.x, instance.z])
-    if side == "left":
-        return bearing < 15.0
-    return bearing > -15.0

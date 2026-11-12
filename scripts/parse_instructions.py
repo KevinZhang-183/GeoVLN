@@ -71,6 +71,12 @@ ACTION_ALIAS = {
     "stop_at": "stop",
 }
 ARTICLES = {"the", "a", "an"}
+ALONG = re.compile(
+    r"\b(?:with|keeping|keep)\s+(?:the\s+|a\s+|an\s+)?([a-z][a-z ]*?)\s+(?:on|to)\s+(?:your|the)\s+(left|right)\b"
+)
+ALONG_SKIP = {"wall", "walls"}
+EXIT_WORDS = re.compile(r"\b(?:exit|leave|walk out|go out|get out|out of)\b")
+CLAUSE_BREAK = re.compile(r"[.;!]|\bthen\b")
 SIDE_PREFIX = re.compile(r"^(?:to\s+)?(?:the\s+)?(left|right)(?:\s+side)?\s+of\s+(.+)$")
 SIDE_SUFFIX = re.compile(r"^(.+?)\s+(?:on|to)\s+(?:the|your)\s+(left|right)$")
 NEAR_SPLIT = re.compile(r"^(.+?)\s+(?:next to|near|beside|by)\s+(.+)$")
@@ -152,7 +158,7 @@ OBJECT_WORDS = {
 
 PROMPT = """Split the navigation instruction into steps, in order.
 
-Each step is {"action": ..., "landmark": ..., "near": ..., "side": ...}.
+Each step is {"action": ..., "landmark": ..., "near": ..., "side": ..., "along": ..., "along_side": ...}.
 action is one of:
 - go_to: walk to, into, through or past the landmark.
 - exit: leave a room. landmark is the room being left, or "" if it is not named.
@@ -175,8 +181,15 @@ side is "left" or "right" when the instruction says which side, else "". It is n
 - "left of the table" sets side to left and near to "table".
 - "leftmost" and "rightmost" stay in the landmark and do not set side.
 - "behind", "opposite", and "past" do not set side.
+along is an object the step keeps on one side while moving, when it is not the landmark, else "". along_side is "left" or "right" for it, else "".
+- "Exit the room with the fireplace on your left" is exit with along "fireplace" and along_side "left".
+- "Keeping the table to your right" sets along "table" and along_side "right".
+- A wall is not an along object. Leave along and along_side "" on every other step.
 
 Reply with JSON only: {"steps": [...]}
+
+Instruction: Exit the bedroom with the fireplace on your left and stop at the stairs.
+{"steps": [{"action": "exit", "landmark": "bedroom", "near": "", "side": "", "along": "fireplace", "along_side": "left"}, {"action": "stop", "landmark": "stairs", "near": "", "side": "", "along": "", "along_side": ""}]}
 
 Instruction: Turn around and walk out of the bedroom. Go past the stairs and stop next to the potted plant.
 {"steps": [{"action": "turn_around", "landmark": "", "near": "", "side": ""}, {"action": "exit", "landmark": "bedroom", "near": "", "side": ""}, {"action": "go_to", "landmark": "stairs", "near": "", "side": ""}, {"action": "stop", "landmark": "potted plant", "near": "", "side": ""}]}
@@ -342,14 +355,20 @@ def validate(parsed: dict) -> tuple[dict | None, list[str], list[str]]:
             landmark, near = _landmark(match.group(1)), _landmark(match.group(2))
         if near == landmark:
             near = ""
+        along, along_side = _landmark(item.get("along")), _side(item.get("along_side"))
+        if not along or not along_side or along in ALONG_SKIP:
+            along, along_side = "", ""
+        elif along == landmark:
+            side = side or along_side
+            along, along_side = "", ""
         if action in TURNS:
             if landmark:
-                out.append(_step("go_to", landmark, near, side))
+                out.append(_step("go_to", landmark, near, side, along, along_side))
             out.append(_step(action))
             continue
         if action == "go_to" and not landmark:
             continue
-        out.append(_step(action, landmark, near, side))
+        out.append(_step(action, landmark, near, side, along, along_side))
     if errors:
         return None, errors, flags
 
@@ -366,7 +385,13 @@ def validate(parsed: dict) -> tuple[dict | None, list[str], list[str]]:
         out.append(_step("stop"))
     if not out[-1]["landmark"] and len(out) >= 2 and out[-2]["action"] == "go_to":
         previous = out.pop(-2)
-        out[-1].update(landmark=previous["landmark"], near=previous["near"], side=previous["side"])
+        out[-1].update(
+            landmark=previous["landmark"],
+            near=previous["near"],
+            side=previous["side"],
+            along=previous["along"],
+            along_side=previous["along_side"],
+        )
 
     deduped = []
     for step in out:
@@ -409,8 +434,61 @@ def _same_place(left: dict, right: dict) -> bool:
     )
 
 
-def _step(action: str, landmark: str = "", near: str = "", side: str = "") -> dict:
-    return {"action": action, "landmark": landmark, "near": near, "side": side}
+def _step(action: str, landmark: str = "", near: str = "", side: str = "", along: str = "", along_side: str = "") -> dict:
+    return {"action": action, "landmark": landmark, "near": near, "side": side, "along": along, "along_side": along_side}
+
+
+def fill_along(parsed: dict | None, instruction: str) -> dict | None:
+    """Add along objects from the instruction text to results parsed before the field existed.
+
+    "with the fireplace on your left" belongs to the step named just before it
+    in the same clause, otherwise to the next step named after it.
+    """
+    if not parsed or not instruction:
+        return parsed
+    steps = parsed.get("subtasks") or []
+    if any(step.get("along") for step in steps):
+        return parsed
+    text = instruction.lower()
+    anchors = []
+    cursor = 0
+    for index, step in enumerate(steps):
+        if step.get("action") in TURNS:
+            continue
+        words = (step.get("landmark") or "").split()
+        if words:
+            found = re.search(r"\b" + re.escape(words[-1]) + r"\b", text[cursor:])
+        elif step.get("action") == "exit":
+            found = EXIT_WORDS.search(text[cursor:])
+        else:
+            found = None
+        if found is None:
+            continue
+        start, end = cursor + found.start(), cursor + found.end()
+        anchors.append((index, start, end))
+        cursor = end
+    if not anchors:
+        return parsed
+    for match in ALONG.finditer(text):
+        name, side = _landmark(match.group(1)), match.group(2)
+        if not name or name in ALONG_SKIP:
+            continue
+        before = [item for item in anchors if item[2] <= match.start()]
+        after = [item for item in anchors if item[1] >= match.end()]
+        if before and not CLAUSE_BREAK.search(text[before[-1][2]:match.start()]):
+            target = before[-1][0]
+        elif after:
+            target = after[0][0]
+        elif before:
+            target = before[-1][0]
+        else:
+            continue
+        step = steps[target]
+        if name == step.get("landmark"):
+            step["side"] = step.get("side") or side
+            continue
+        step["along"], step["along_side"] = name, side
+    return parsed
 
 
 def parse_one(client: VLMClient, instruction: str, retries: int = 1) -> tuple[dict | None, list[str], str | None]:
@@ -425,7 +503,7 @@ def parse_one(client: VLMClient, instruction: str, retries: int = 1) -> tuple[di
             continue
         normalized, hard, flags = validate(parsed)
         if normalized is not None:
-            return normalized, flags, None
+            return fill_along(normalized, instruction), flags, None
         errors = hard
     return None, [], (last_raw or "")[:2000]
 
@@ -460,6 +538,8 @@ def write_review(path: Path, rows: list[dict], review_n: int, seed: int) -> None
                 detail += f" [{item['side']}]"
             if item.get("near"):
                 detail += f" (near {item['near']})"
+            if item.get("along"):
+                detail += f" <{item['along']} on {item['along_side']}>"
             lines.append(f"{item['id']}. {item['action']} {detail}".rstrip())
         flags = row.get("flags") or []
         lines.append("标记：" + ("；".join(flags) if flags else "无"))
@@ -699,6 +779,31 @@ def self_check() -> None:
     assert blocked is None and any("no step has a landmark" in error for error in errors)
     unknown, errors, _flags = validate({"steps": [{"action": "fly", "landmark": "chair"}]})
     assert unknown is None and errors
+
+    along, errors, _flags = validate(
+        {
+            "steps": [
+                {"action": "exit", "landmark": "bedroom", "along": "the fireplace", "along_side": "on your left"},
+                {"action": "go_to", "landmark": "stairs", "along": "wall", "along_side": "right"},
+                {"action": "stop", "landmark": "lamp", "along": "lamp", "along_side": "right"},
+            ]
+        }
+    )
+    assert not errors, errors
+    assert [(s["along"], s["along_side"], s["side"]) for s in along["subtasks"]] == [
+        ("fireplace", "left", ""),
+        ("", "", ""),
+        ("", "", "right"),
+    ]
+
+    text = "Exit the bedroom with the fireplace on your left. Walk down the hall and stop at the stairs."
+    old, errors, _flags = validate({"steps": [{"action": "exit", "landmark": "bedroom"}, {"action": "stop", "landmark": "stairs"}]})
+    filled = fill_along(old, text)
+    assert (filled["subtasks"][0]["along"], filled["subtasks"][0]["along_side"]) == ("fireplace", "left")
+    assert filled["subtasks"][1]["along"] == ""
+    lead = "Keeping the table to your right, go to the door. Stop by the plant."
+    old, errors, _flags = validate({"steps": [{"action": "go_to", "landmark": "door"}, {"action": "stop", "landmark": "plant"}]})
+    assert fill_along(old, lead)["subtasks"][0]["along"] == "table"
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

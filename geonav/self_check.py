@@ -462,6 +462,64 @@ def check_door_choice():
     assert switched.kind == "waypoint" and switched.waypoint.name == "P2", switched.reason
 
 
+def check_side_constraints():
+    """Along objects and target sides filter candidates; an unseen along object filters nothing."""
+    from geonav.geom import bearing_deg
+    from geonav.policy import along_ok
+
+    origin = pose_at(0.0, 0.0, (0.0, 1.0))
+    left_ref = np.array([-2.0, 3.0]) if bearing_deg(origin, [-2.0, 3.0]) < 0 else np.array([2.0, 3.0])
+    right_ref = -left_ref * np.array([1.0, -1.0])
+    assert bearing_deg(origin, left_ref) < -15.0 and bearing_deg(origin, right_ref) > 15.0
+    assert along_ok(left_ref, np.zeros(2), [0.0, 4.0], "left")
+    assert not along_ok(left_ref, np.zeros(2), [0.0, 4.0], "right")
+    assert not along_ok(left_ref, np.zeros(2), [0.0, -4.0], "left"), "an object behind the walk is not beside it"
+
+    # Exit with the fireplace on the left: the door straight ahead keeps it there, the nearer side door does not.
+    ahead = _Track(1, [0.0, 4.0], [0.0, 1.0], "candidate")
+    ahead.width = 1.5
+    beside = _Track(2, [right_ref[0] * 1.5, 0.5], [1.0, 0.0], "confirmed")
+    beside.width = 1.5
+    world = _FakeWorld(make_grid())
+    world.portals.tracks += [ahead, beside]
+    world.active_portals = lambda: [ahead, beside]
+    parsed = {
+        "end_landmark": "stairs",
+        "subtasks": [
+            {"id": 1, "action": "exit", "landmark": "bedroom", "near": "", "side": "", "along": "fireplace", "along_side": "left"},
+            {"id": 2, "action": "stop", "landmark": "stairs", "near": "", "side": "", "along": "", "along_side": ""},
+        ],
+    }
+    blind = Policy("landmark", parsed, None, allow_look=False)
+    assert blind.decide(world, origin, 0).waypoint.name == "P2", "without the fireplace the better door wins"
+    fireplace = Instance(9, "fireplace", left_ref, 0.3, 0.9, "0001")
+    fireplace.hits = 2
+    world.semantic.instances.append(fireplace)
+    guided = Policy("landmark", parsed, None, allow_look=False)
+    decision = guided.decide(world, origin, 0)
+    assert decision.kind == "waypoint" and decision.waypoint.name == "P1", decision.reason
+
+    # A target named on the left is never taken from the right.
+    sided = {
+        "end_landmark": "lamp",
+        "subtasks": [
+            {"id": 1, "action": "go_to", "landmark": "chair", "near": "", "side": "left"},
+            {"id": 2, "action": "stop", "landmark": "lamp", "near": "", "side": ""},
+        ],
+    }
+    world = _FakeWorld(make_grid())
+    chair = Instance(4, "chair", right_ref, 0.2, 0.9, "0001")
+    chair.hits = 2
+    world.semantic.instances.append(chair)
+    policy = Policy("landmark", sided, None, allow_look=True)
+    assert policy.decide(world, origin, 0).kind == "look"
+    chair_left = Instance(5, "chair", left_ref * np.array([1.0, 1.5]), 0.2, 0.9, "0002")
+    chair_left.hits = 2
+    world.semantic.instances.append(chair_left)
+    chosen = policy.decide(world, origin, 1)
+    assert chosen.kind == "waypoint" and chosen.waypoint.name == "L5", chosen.reason
+
+
 def check_goal_stop():
     grid = make_grid()
     world = _FakeWorld(grid)
@@ -941,6 +999,7 @@ def main():
     check_stop_rules()
     check_frontier_choice()
     check_door_choice()
+    check_side_constraints()
     check_goal_stop()
     check_look_budget()
     check_explored_door()
