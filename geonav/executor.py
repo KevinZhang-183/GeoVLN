@@ -9,9 +9,11 @@ from geonav.geom import INFLATE_M, bearing_deg, block_ahead, heading_error_deg, 
 FORWARD = "move_forward"
 LEFT = "turn_left"
 RIGHT = "turn_right"
-# One simulator turn is 15 degrees. Ten degrees never stays inside the window
-# while the door normal is refit, so arrival accepts a heading within 30.
+# One simulator turn is 15 degrees, one step is 0.25 m. Arrival accepts 30
+# degrees. A full circle of turns with no step means the aim is not usable.
 ALIGN_DEG = 30.0
+STEP_M = 0.25
+TURN_LIMIT = 24
 
 
 class Executor:
@@ -29,6 +31,9 @@ class Executor:
         self.reached = False
         self._align_heading = None
         self._align_stage = None
+        self._progress_aim = None
+        self._progress_stage = None
+        self._turns = 0
 
     def clear(self):
         self.waypoint = None
@@ -40,6 +45,9 @@ class Executor:
         self.reached = False
         self._align_heading = None
         self._align_stage = None
+        self._progress_aim = None
+        self._progress_stage = None
+        self._turns = 0
 
     def set_waypoint(self, waypoint):
         if waypoint is None:
@@ -49,8 +57,7 @@ class Executor:
             self.waypoint = waypoint
             stage = min(self.stage, len(waypoint.stages) - 1)
             if stage != self.stage:
-                self._align_heading = None
-                self._align_stage = None
+                self._forget_aim()
                 self.stage = stage
             return
         self.waypoint = waypoint
@@ -60,8 +67,8 @@ class Executor:
         self.stuck_count = 0
         self.abandoned = False
         self.reached = False
-        self._align_heading = None
-        self._align_stage = None
+        self._forget_aim()
+        self._turns = 0
 
     def target(self):
         if self.waypoint is None or self.stage >= len(self.waypoint.stages):
@@ -79,9 +86,9 @@ class Executor:
         agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
         if float(np.hypot(agent[0] - target.xz[0], agent[1] - target.xz[1])) <= target.radius:
             if target.heading is not None and not self._heading_ok(pose, target):
-                return _turn(heading_error_deg(pose, self._align_heading))
-            self._align_heading = None
-            self._align_stage = None
+                return self._give_turn(heading_error_deg(pose, self._align_heading))
+            self._forget_aim()
+            self._turns = 0
             self.stage += 1
             self._forwards = []
             self.stuck_count = 0
@@ -113,13 +120,44 @@ class Executor:
             if self.stuck_count >= 2:
                 self.abandoned = True
                 return None
-            return LEFT
-        aim = lookahead(route, agent, self.lookahead_m)
+            return self._give_turn(-1.0)
+        aim = self._follow_aim(route, agent, target)
         error = bearing_deg(pose, aim)
         if abs(error) > self.turn_deg:
-            return _turn(error)
+            return self._give_turn(error)
+        self._turns = 0
         self._forwards.append(agent.copy())
         return FORWARD
+
+    def _follow_aim(self, route, agent, target):
+        """Steer along the path, or to the stage point once the path has run out.
+
+        A lookahead under the agent's feet has no stable bearing. The door point
+        is also refit every frame, so latch the stage point the moment the path
+        stops leading anywhere.
+        """
+        aim = lookahead(route, agent, self.lookahead_m)
+        if aim is not None and float(np.hypot(aim[0] - agent[0], aim[1] - agent[1])) >= STEP_M:
+            self._progress_aim = None
+            self._progress_stage = None
+            return aim
+        if self._progress_stage != self.stage or self._progress_aim is None:
+            self._progress_aim = np.array(target.xz, dtype=np.float64, copy=True)
+            self._progress_stage = self.stage
+        return self._progress_aim
+
+    def _give_turn(self, error):
+        self._turns += 1
+        if self._turns > TURN_LIMIT:
+            self.abandoned = True
+            return None
+        return _turn(error)
+
+    def _forget_aim(self):
+        self._align_heading = None
+        self._align_stage = None
+        self._progress_aim = None
+        self._progress_stage = None
 
     def _heading_ok(self, pose, target):
         """Face the heading this stage had when the agent arrived.

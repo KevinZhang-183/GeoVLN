@@ -186,6 +186,61 @@ def _rotated(forward, degrees):
     return forward * np.cos(angle) + right * np.sin(angle)
 
 
+def check_exhausted_path():
+    """A path that ends under the agent walks toward the stage point, then gives up if the aim keeps moving."""
+    from geonav.waypoints import point_waypoint
+
+    grid = make_grid()
+    pose = pose_at(0.0, 0.0, (0.0, 1.0))
+    waypoint = point_waypoint("P8", [0.0, 0.8], radius=0.3, snap_m=1.0)
+    executor = Executor()
+    executor.set_waypoint(waypoint)
+    executor.path = [np.array([0.0, 0.0])]
+    assert executor.act(pose, grid) == "move_forward"
+
+    pose = pose_at(0.0, 0.0, (1.0, 0.0))
+    waypoint = point_waypoint("P8", [0.0, 0.8], radius=0.3, snap_m=1.0)
+    executor = Executor()
+    executor.set_waypoint(waypoint)
+    executor.path = [np.array([0.0, 0.0])]
+    action = None
+    turns = 0
+    for _ in range(16):
+        action = executor.act(pose, grid)
+        if action == "move_forward" or executor.abandoned:
+            break
+        assert action in ("turn_left", "turn_right")
+        pose = _turned(pose, action)
+        turns += 1
+        waypoint.stages[0].xz = np.array([0.3, 0.8])
+        executor.set_waypoint(waypoint)
+        executor.path = [np.array([0.0, 0.0])]
+    assert action == "move_forward", (action, turns, executor.abandoned)
+    assert turns <= 12, turns
+
+    pose = pose_at(0.0, 0.0, (0.0, 1.0))
+    waypoint = point_waypoint("P8", [0.6, 0.0], radius=0.3, snap_m=1.0)
+    executor = Executor()
+    executor.set_waypoint(waypoint)
+    turns = 0
+    for _ in range(40):
+        forward = -pose[[0, 2], 2]
+        right = np.array([-forward[1], forward[0]])
+        agent = pose[[0, 2], 3]
+        aim = agent + right * 0.6
+        waypoint.stages[0].xz = np.array(aim, dtype=np.float64)
+        executor.set_waypoint(waypoint)
+        executor.path = [np.array(agent, dtype=np.float64), np.array(aim, dtype=np.float64)]
+        action = executor.act(pose, grid)
+        if executor.abandoned:
+            break
+        assert action in ("turn_left", "turn_right")
+        pose = _turned(pose, action)
+        turns += 1
+    assert executor.abandoned, "a full circle of turns should give up the waypoint"
+    assert turns <= 24, turns
+
+
 def check_stuck():
     grid = make_grid()
     pose = pose_at(0.0, 0.0, (0.0, 1.0))
@@ -741,6 +796,7 @@ def main():
     check_merge()
     check_shared_grid()
     check_align()
+    check_exhausted_path()
     check_stuck()
     check_landmark_policy()
     check_goal_stop()
