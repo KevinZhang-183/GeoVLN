@@ -1,9 +1,64 @@
 """Put the existing map scripts on the import path without importing Habitat."""
 
+import os
+import signal
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+RESULT_DIR = Path("/root/data1/StreamVLN/results/geonav_r2r_100")
+
+
+def redirect_stdio(path):
+    """Write stdout and stderr to a file, and keep running after the terminal closes.
+
+    A remote IDE stops reading its terminal when the laptop sleeps. The next
+    print then blocks on a full pipe. A file does not need a reader, and
+    ignoring hangup keeps the process alive after that terminal is torn down.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    notice = f"日志写到 {path}  pid={os.getpid()}\n".encode()
+    for fd in (2, 1):
+        try:
+            os.write(fd, notice)
+            break
+        except OSError:
+            continue
+    hangup = getattr(signal, "SIGHUP", None)
+    if hangup is not None:
+        signal.signal(hangup, signal.SIG_IGN)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            pass
+    log_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        targets = {1, 2}
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                targets.add(stream.fileno())
+            except (AttributeError, OSError, ValueError):
+                pass
+        for target in targets:
+            try:
+                os.dup2(log_fd, target)
+            except OSError:
+                pass
+    finally:
+        if log_fd > 2:
+            os.close(log_fd)
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(line_buffering=True)
+        except (OSError, ValueError):
+            pass
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), f"pid={os.getpid()}", flush=True)
 
 
 def install():

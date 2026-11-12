@@ -13,8 +13,9 @@ import io
 import json
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
-from geonav._bootstrap import install
+from geonav._bootstrap import RESULT_DIR, install, redirect_stdio
 
 install()
 
@@ -60,7 +61,7 @@ def _segment(processor, image, prompts, min_score, limit):
     return results
 
 
-def serve(processor, host, port, min_score, limit):
+def serve(processor, host, port, min_score, limit, log_path):
     from PIL import Image
 
     class Handler(BaseHTTPRequestHandler):
@@ -87,17 +88,23 @@ def serve(processor, host, port, min_score, limit):
 
         def log_message(self, fmt, *args):
             sys.stderr.write("%s\n" % (fmt % args))
+            sys.stderr.flush()
 
         def _send(self, status, payload):
             raw = json.dumps(payload).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
 
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"SAM3 listening on http://{host}:{port}", flush=True)
+    redirect_stdio(log_path)
     server.serve_forever()
 
 
@@ -108,9 +115,10 @@ def main():
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--min-score", type=float, default=0.45)
     parser.add_argument("--limit", type=int, default=5, help="masks kept per prompt")
+    parser.add_argument("--log", type=Path, default=RESULT_DIR / "sam3.log")
     args = parser.parse_args()
     processor = load_processor(args.checkpoint)
-    serve(processor, args.host, args.port, args.min_score, args.limit)
+    serve(processor, args.host, args.port, args.min_score, args.limit, args.log)
 
 
 if __name__ == "__main__":

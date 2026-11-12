@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from geonav._bootstrap import ROOT, install_habitat
+from geonav._bootstrap import ROOT, install_habitat, redirect_stdio
 from geonav.episodes import episode_key, load_rows
 from geonav.executor import Executor
 from geonav.policy import Policy
@@ -61,6 +61,7 @@ def entry_look_skipped(look_kind, look_xz, anchor_xz):
 
 
 def run_episodes(args):
+    redirect_stdio(Path(args.output) / "run.log")
     rows = load_rows(args.parsed)
     if args.limit:
         rows = rows[: args.limit]

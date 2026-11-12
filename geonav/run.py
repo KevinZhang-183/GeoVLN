@@ -13,6 +13,9 @@ Then, in the streamvln env (Python 3.9, Habitat 0.2.4), from the GeoVLN director
     python -m geonav.run --mode goal
     python -m geonav.run --mode explore
     python -m geonav.run --mode landmark
+
+Episode files go to --output (default /root/data1/StreamVLN/results/geonav_r2r_100).
+Progress is appended to <output>/run.log, so closing the laptop does not stall the run.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from geonav._bootstrap import ROOT
+from geonav._bootstrap import RESULT_DIR, ROOT
 from geonav.episodes import episode_key, load_rows
 
 PARSED = "/root/data1/StreamVLN/results/r2r_val_unseen_v1_3/parsed_instructions.json"
@@ -36,7 +39,7 @@ def main():
     parser.add_argument("--scenes-dir", type=Path, default=Path(SCENES))
     parser.add_argument("--config", type=Path, default=ROOT / "config" / "vln_r2r.yaml")
     parser.add_argument("--split", default="val_unseen")
-    parser.add_argument("--output", type=Path, default=Path("results/geonav"))
+    parser.add_argument("--output", type=Path, default=RESULT_DIR)
     parser.add_argument("--limit", type=int, default=0, help="只跑解析列表里的前 N 条，0 表示全部")
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--gpu", type=int, default=0)
