@@ -324,6 +324,80 @@ def check_landmark_policy():
     assert decision.kind == "waypoint" and decision.waypoint.name == "L4", decision.reason
 
 
+def check_stop_rules():
+    from geonav.policy import room_point
+
+    def strong(index, label, xz):
+        item = Instance(index, label, xz, 0.2, 0.8, "0001")
+        item.hits = 3
+        item.score_sum = 2.4
+        return item
+
+    origin = pose_at(0.0, 0.0, (0.0, 1.0))
+
+    # Episode 166: a lamp beside the start does not end a two-step instruction before it moves.
+    world = _FakeWorld(make_grid())
+    windows = strong(1, "windows", [0.0, 3.0])
+    windows.hits = 4
+    world.semantic.instances += [windows, strong(5, "lamp", [0.3, 1.0])]
+    parsed = {
+        "end_landmark": "lamp",
+        "subtasks": [
+            {"id": 1, "action": "go_to", "landmark": "windows", "near": "", "side": ""},
+            {"id": 2, "action": "stop", "landmark": "lamp", "near": "", "side": ""},
+        ],
+    }
+    policy = Policy("landmark", parsed, None, allow_look=True)
+    first = policy.decide(world, origin, 0)
+    assert first.kind == "waypoint" and first.waypoint.name == "L1", first.reason
+
+    # The final lamp is walked to first, and a lamp reached within 3 m of the start is rejected.
+    single = {"end_landmark": "lamp", "subtasks": [{"id": 1, "action": "stop", "landmark": "lamp", "near": "", "side": ""}]}
+    world = _FakeWorld(make_grid())
+    weak = Instance(7, "lamp", [0.0, 2.0], 0.2, 0.8, "0001")
+    weak.hits = 2
+    world.semantic.instances += [weak, strong(5, "lamp", [0.0, 1.0])]
+    policy = Policy("landmark", single, None, allow_look=True)
+    go = policy.decide(world, origin, 0)
+    assert go.kind == "waypoint" and go.waypoint.name == "L5", go.reason
+    policy.note_reached(go.waypoint)
+    near = policy.decide(world, pose_at(0.0, 1.0, (0.0, 1.0)), 1)
+    assert near.kind != "stop" or near.reason == "no candidate", near.reason
+    assert 5 in policy.rejected
+    world.semantic.instances.append(strong(6, "lamp", [0.0, 5.0]))
+    far = policy.decide(world, pose_at(0.0, 1.0, (0.0, 1.0)), 2)
+    assert far.kind == "waypoint" and far.waypoint.name == "L6", far.reason
+    policy.note_reached(far.waypoint)
+    done = policy.decide(world, pose_at(0.0, 4.0, (0.0, 1.0)), 3)
+    assert done.kind == "stop" and done.reason == "finished", done.reason
+
+    # A room name does not stop on sight. The agent walks past the doorway it crossed first.
+    grid = make_grid()
+    grid.explored[:] = True
+    point = room_point(grid, np.array([0.0, 2.0]), np.array([0.0, 1.0]))
+    assert point is not None and point[1] >= 3.4, point
+    room = {"end_landmark": "bedroom", "subtasks": [{"id": 1, "action": "stop", "landmark": "bedroom", "near": "", "side": ""}]}
+    world = _FakeWorld(grid)
+    world.portals.tracks.append(_Track(3, [0.0, 2.0], [0.0, 1.0], "traversed"))
+    policy = Policy("landmark", room, None, allow_look=True)
+    assert "bed" in policy.prompts()
+    opening = policy.decide(world, origin, 0)
+    assert opening.kind != "stop", opening.reason
+    policy.entered = (3, 1.0, 0)
+    walk = policy.decide(world, pose_at(0.0, 2.5, (0.0, 1.0)), 1)
+    assert walk.kind == "waypoint" and walk.waypoint.name == "R", walk.reason
+    policy.note_reached(walk.waypoint)
+    inside = policy.decide(world, pose_at(0.0, 4.0, (0.0, 1.0)), 2)
+    assert inside.kind == "stop" and inside.reason == "finished", inside.reason
+
+    # When the final landmark never shows up, the agent still stops once it has moved and run out of budget.
+    world = _FakeWorld(make_grid())
+    policy = Policy("landmark", single, None, allow_look=True)
+    assert policy.decide(world, origin, 0).kind == "look"
+    late = policy.decide(world, pose_at(0.0, 4.0, (0.0, 1.0)), 80)
+    assert late.kind == "stop" and late.reason == "fallback", late.reason
+
+
 def check_goal_stop():
     grid = make_grid()
     world = _FakeWorld(grid)
@@ -799,6 +873,7 @@ def main():
     check_exhausted_path()
     check_stuck()
     check_landmark_policy()
+    check_stop_rules()
     check_goal_stop()
     check_look_budget()
     check_explored_door()

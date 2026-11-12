@@ -271,7 +271,7 @@ def run_one(env, episode, row, args, client):
 
 
 def _made_progress(reason):
-    if reason in ("goal", "backtrack"):
+    if reason in ("goal", "backtrack", "R"):
         return True
     return len(reason) > 1 and reason[0] in "PLFN" and reason[1].isdigit()
 

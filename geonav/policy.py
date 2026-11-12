@@ -12,7 +12,7 @@ from parse_instructions import _landmark, _place_only  # noqa: E402
 from portal_map import NOT_A_DOOR, _agent_axes  # noqa: E402
 
 from geonav.geom import bearing_deg, plan  # noqa: E402
-from geonav.waypoints import landmark_waypoint, point_waypoint, portal_waypoint, stand_point  # noqa: E402
+from geonav.waypoints import Waypoint, landmark_waypoint, point_waypoint, portal_waypoint, stand_point  # noqa: E402
 from geonav.world import _is_door  # noqa: E402
 
 TURNS = {
@@ -22,6 +22,34 @@ TURNS = {
 }
 APPROACH_LOOK_M = 2.0
 TURN_NAMES = set(TURNS)
+# The final landmark ends the episode, so one or two flickering masks are not enough.
+FINAL_HITS = 3
+FINAL_SCORE = 0.6
+# R2R counts a stop within 3 m of the goal, and episodes do not start that close to it.
+MIN_STOP_TRAVEL_M = 3.0
+FALLBACK_STEPS = 80
+ROOM_DEPTH_M = 1.5
+ROOM_RADIUS_M = 4.0
+ROOM_ANCHORS = {
+    "kitchen": ("refrigerator", "stove", "oven"),
+    "bedroom": ("bed",),
+    "bathroom": ("toilet", "bathtub", "shower"),
+    "living room": ("sofa", "couch", "tv"),
+    "dining room": ("dining table",),
+    "office": ("desk",),
+    "laundry room": ("washing machine",),
+}
+SYNONYMS = {
+    "lamp": ("light", "floor lamp", "table lamp"),
+    "couch": ("sofa",),
+    "sofa": ("couch",),
+    "tv": ("television",),
+    "television": ("tv",),
+    "fridge": ("refrigerator",),
+    "refrigerator": ("fridge",),
+    "rug": ("carpet",),
+    "carpet": ("rug",),
+}
 
 
 class Decision:
@@ -58,6 +86,11 @@ class Policy:
         self.step = 0
         self.ready = False
         self.looks = []
+        self.origin_xz = None
+        self.rejected = set()
+        self.entered = None
+        self.fallback = False
+        self.room_rejected = False
 
     def prompts(self):
         """Phrases for SAM3. Goal follows the dataset point and does not build landmarks."""
@@ -68,11 +101,14 @@ class Policy:
 
     def decide(self, world, pose, step):
         self._move(pose, step)
+        if self.origin_xz is None:
+            self.origin_xz = np.asarray(pose, dtype=np.float64)[[0, 2], 3].copy()
         if not self.ready:
             self._begin(world, pose)
             self.ready = True
         if self.mode == "goal":
             return self._goal(pose)
+        self._note_entry(world, pose)
         if self.pending:
             return Decision("action", action=self.pending.pop(0), reason=self.pending_reason)
         if self.turn_sets_prior:
@@ -81,11 +117,10 @@ class Policy:
             self._finish(world, pose)
         if self.mode == "landmark":
             self._skip_if_needed(world, pose)
+            self._start_fallback()
             self._complete_ready(world, pose)
             if self._current() is None:
-                return Decision("stop", reason="finished")
-            if self.index >= len(self.steps) - 2 and self._near_end(world, pose):
-                return Decision("stop", reason="end landmark")
+                return Decision("stop", reason="fallback" if self.fallback else "finished")
             current = self._current()
             if current["action"] in TURN_NAMES:
                 action, count = TURNS[current["action"]]
@@ -93,8 +128,6 @@ class Policy:
                 self.pending_reason = current["action"]
                 self.turn_sets_prior = True
                 return Decision("action", action=self.pending.pop(0), reason=self.pending_reason)
-            if current["action"] == "stop" and _place_only(current.get("landmark") or ""):
-                return Decision("stop", reason="room")
         if self._object_upgrade(world, pose):
             return Decision("waypoint", waypoint=self.lock, reason=self.lock.name)
         if self.lock is not None and self._lock_ok(world):
@@ -175,19 +208,23 @@ class Policy:
     def _choose(self, world, pose):
         if self.mode == "landmark":
             current = self._current()
-            if current is not None and current["action"] in ("go_to", "stop"):
+            if current is not None and self._is_final():
+                choice = self._final_choice(world, pose, current)
+                if choice is not None:
+                    return choice
+            elif current is not None and current["action"] in ("go_to", "stop"):
                 if not _place_only(current.get("landmark") or "") and not _is_door(current.get("landmark") or ""):
                     found = self._best_instance(world, current, pose)
                     if found is not None:
                         return self._landmark_wp(found, world, pose, current.get("side") or "")
-                if (
-                    current["action"] == "exit"
-                    or _place_only(current.get("landmark") or "")
-                    or _is_door(current.get("landmark") or "")
-                ):
+                if _place_only(current.get("landmark") or "") or _is_door(current.get("landmark") or ""):
                     choice = self._door_choice(world, pose, current)
                     if choice is not None:
                         return choice
+            elif current is not None and current["action"] == "exit":
+                choice = self._door_choice(world, pose, current)
+                if choice is not None:
+                    return choice
         portal = self._best_portal(world, pose, None, "")
         if portal is not None:
             return portal
@@ -206,6 +243,91 @@ class Policy:
                 return choice
         return self._best_portal(world, pose, None, side)
 
+    def _final_choice(self, world, pose, step):
+        """Where the last step walks before it may stop. Every stop has a go part first."""
+        action = step["action"]
+        landmark = step.get("landmark") or ""
+        if action == "exit" or _place_only(landmark):
+            anchor = self._room_anchor(world, step, pose) if _place_only(landmark) else None
+            if anchor is not None:
+                return self._landmark_wp(anchor, world, pose, step.get("side") or "")
+            room = self._room_waypoint(world, pose)
+            if room is not None:
+                return room
+            if self.fallback:
+                return None
+            return self._door_choice(world, pose, step)
+        if self.fallback:
+            return self._room_waypoint(world, pose)
+        if action not in ("go_to", "stop") or not landmark:
+            return None
+        if _is_door(landmark):
+            door = self._door_choice(world, pose, step)
+            if door is None:
+                return None
+            # Stop in front of the door, not on the far side of it.
+            return Waypoint(door.name, door.stages[:1], portal_id=door.portal_id)
+        found = self._best_instance(world, step, pose, final=True)
+        if found is not None:
+            return self._landmark_wp(found, world, pose, step.get("side") or "")
+        return None
+
+    def _room_anchor(self, world, step, pose):
+        labels = _room_anchor_labels(step.get("landmark") or "")
+        if not labels:
+            return None
+        agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
+        pool = [
+            item for item in world.semantic.instances
+            if item.label in labels and item.id not in self.rejected and _strong(item)
+        ]
+        if not pool:
+            return None
+        pool.sort(key=lambda item: float(np.hypot(item.x - agent[0], item.z - agent[1])))
+        return pool[0]
+
+    def _room_waypoint(self, world, pose):
+        """Walk into the space beyond the last doorway crossed during this step or the one before it."""
+        if self.room_rejected or self.entered is None or world.grid is None:
+            return None
+        track_id, sign, index = self.entered
+        if not self.fallback and index < self.index - 1:
+            return None
+        track = world.portals.track(track_id)
+        if track is None:
+            return None
+        point = room_point(world.grid, track.center, sign * np.asarray(track.normal, dtype=np.float64))
+        if point is None:
+            return None
+        return point_waypoint("R", point, radius=0.6, snap_m=1.0)
+
+    def _note_entry(self, world, pose):
+        agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
+        for track_id in getattr(world, "new_traversals", None) or []:
+            track = world.portals.track(track_id)
+            if track is None or getattr(track, "reject", "") in NOT_A_DOOR:
+                continue
+            side = float(np.dot(agent - np.asarray(track.center), np.asarray(track.normal)))
+            self.entered = (track_id, 1.0 if side >= 0.0 else -1.0, self.index)
+            self.room_rejected = False
+
+    def _start_fallback(self):
+        if self.fallback or not self._is_final():
+            return
+        if self.step - self.start_step < FALLBACK_STEPS:
+            return
+        self.fallback = True
+        self.lock = None
+
+    def _is_final(self):
+        return self.mode == "landmark" and bool(self.steps) and self.index == len(self.steps) - 1
+
+    def _may_stop(self, pose):
+        if self.origin_xz is None:
+            return True
+        agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
+        return float(np.hypot(agent[0] - self.origin_xz[0], agent[1] - self.origin_xz[1])) >= MIN_STOP_TRAVEL_M
+
     def _object_upgrade(self, world, pose):
         if self.mode != "landmark":
             return False
@@ -215,7 +337,9 @@ class Policy:
         landmark = current.get("landmark") or ""
         if _place_only(landmark) or _is_door(landmark):
             return False
-        found = self._best_instance(world, current, pose)
+        if self._is_final() and self.fallback:
+            return False
+        found = self._best_instance(world, current, pose, final=self._is_final())
         if found is None:
             return False
         if self.lock is not None and self.lock.name == f"L{found.id}":
@@ -232,14 +356,17 @@ class Policy:
         point, heading = stand_point(world.grid, center, agent, radius, side)
         return landmark_waypoint(instance, point, heading, radius)
 
-    def _best_instance(self, world, step, pose):
+    def _best_instance(self, world, step, pose, final=False):
         landmark = step.get("landmark") or ""
         if not landmark:
             return None
+        labels = _labels(landmark)
         matches = []
         need = world.semantic.config.confirm_hits
         for instance in world.semantic.instances:
-            if instance.hits < need or instance.label != landmark:
+            if instance.hits < need or instance.label not in labels or instance.id in self.rejected:
+                continue
+            if final and not _strong(instance):
                 continue
             if not self._near_ok(instance, step, world):
                 continue
@@ -356,6 +483,8 @@ class Policy:
         current = self._current()
         if current is None or current["action"] in TURN_NAMES:
             return False
+        if self._is_final():
+            return self._final_done(world, pose, current)
         action = current["action"]
         landmark = current.get("landmark") or ""
         room = action == "exit" or (action == "go_to" and _place_only(landmark))
@@ -373,6 +502,35 @@ class Policy:
             return True
         return False
 
+    def _final_done(self, world, pose, step):
+        """The last step ends only after its go part, and never within 3 m of the start."""
+        arrived = self.arrived_name or ""
+        action = step["action"]
+        landmark = step.get("landmark") or ""
+        if arrived == "R" or (self.fallback and self._room_waypoint(world, pose) is None):
+            if self._may_stop(pose):
+                return True
+            if arrived == "R":
+                self.room_rejected = True
+                self.arrived_name = None
+            return False
+        if action == "exit" or _place_only(landmark):
+            if not arrived.startswith("L"):
+                return False
+        elif action in ("go_to", "stop") and not landmark:
+            return self._may_stop(pose)
+        elif _is_door(landmark):
+            if not arrived.startswith("P"):
+                return False
+        elif not arrived.startswith("L"):
+            return False
+        if self._may_stop(pose):
+            return True
+        if arrived.startswith("L") and arrived[1:].isdigit():
+            self.rejected.add(int(arrived[1:]))
+        self.arrived_name = None
+        return False
+
     def _skip_if_needed(self, world, pose):
         if self.tried_skip or self._current() is None:
             return
@@ -380,32 +538,20 @@ class Policy:
         if used < 40 and self.traveled < 8.0:
             return
         self.tried_skip = True
+        last = len(self.steps) - 1
         for index in range(self.index + 1, len(self.steps)):
             step = self.steps[index]
             if step["action"] not in ("go_to", "stop"):
                 continue
             if _place_only(step.get("landmark") or ""):
                 continue
-            if self._best_instance(world, step, pose) is None:
+            if self._best_instance(world, step, pose, final=index == last) is None:
                 continue
             self.index = index
             self.lock = None
             self.arrived_name = None
             self._begin(world, pose)
             return
-
-    def _near_end(self, world, pose):
-        landmark = self.parsed.get("end_landmark") or ""
-        if not landmark or _place_only(landmark):
-            return False
-        agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
-        need = world.semantic.config.confirm_hits
-        for instance in world.semantic.instances:
-            if instance.label != landmark or instance.hits < need:
-                continue
-            if float(np.hypot(instance.x - agent[0], instance.z - agent[1])) <= 1.5:
-                return True
-        return False
 
     def _finish(self, world, pose):
         self.index += 1
@@ -439,7 +585,11 @@ class Policy:
 
 
 def prompts_for(parsed, index):
-    """Object phrases for the current step, the next step, and the final step."""
+    """Object phrases for the current step, the next step, and the final step.
+
+    A room name cannot be segmented, so it is replaced by objects that mark the room.
+    The final landmark also asks for its common other names.
+    """
     steps = [] if not parsed else list(parsed.get("subtasks") or [])
     if not steps:
         return []
@@ -451,10 +601,78 @@ def prompts_for(parsed, index):
         step = steps[cursor]
         for key in ("landmark", "near"):
             text = _landmark(step.get(key, ""))
-            if not text or _place_only(text) or text in found:
+            if not text:
                 continue
-            found.append(text)
+            if _place_only(text):
+                names = _room_anchor_labels(text) if key == "landmark" else ()
+            elif key == "landmark" and cursor == last:
+                names = sorted(_labels(text), key=lambda name: name != text)
+            else:
+                names = (text,)
+            for name in names:
+                if name not in found:
+                    found.append(name)
     return found
+
+
+def room_point(grid, door_center, inward, radius=ROOM_RADIUS_M, depth=ROOM_DEPTH_M):
+    """A free, explored point inside the space beyond a doorway.
+
+    The centroid of explored floor on the far side within ``radius`` meters is
+    used when it sits at least ``depth`` meters past the door; otherwise the
+    point ``depth`` meters straight in. Either is snapped to the nearest
+    explored free cell on that side.
+    """
+    center = np.asarray(door_center, dtype=np.float64)
+    normal = np.asarray(inward, dtype=np.float64)
+    norm = float(np.linalg.norm(normal))
+    if norm < 1e-9:
+        return None
+    normal = normal / norm
+    explored = getattr(grid, "explored", None)
+    if explored is None:
+        return None
+    reach = int(np.ceil(radius / grid.res))
+    col0 = int(np.floor((center[0] - grid.origin[0]) / grid.res))
+    row0 = int(np.floor((center[1] - grid.origin[1]) / grid.res))
+    rows = slice(max(0, row0 - reach), min(explored.shape[0], row0 + reach + 1))
+    cols = slice(max(0, col0 - reach), min(explored.shape[1], col0 + reach + 1))
+    free = explored[rows, cols] & (grid.logodds[rows, cols] < grid.config.free_logodds)
+    rr, cc = np.nonzero(free)
+    if rr.size == 0:
+        return None
+    xs = grid.origin[0] + (cc + cols.start + 0.5) * grid.res
+    zs = grid.origin[1] + (rr + rows.start + 0.5) * grid.res
+    points = np.column_stack((xs, zs))
+    offset = points - center
+    ahead = offset @ normal
+    keep = (ahead >= 0.5) & (np.hypot(offset[:, 0], offset[:, 1]) <= radius)
+    if not np.any(keep):
+        return None
+    inside = points[keep]
+    target = inside.mean(axis=0)
+    if float((target - center) @ normal) < depth:
+        target = center + normal * depth
+    nearest = int(np.argmin(np.hypot(inside[:, 0] - target[0], inside[:, 1] - target[1])))
+    return inside[nearest].copy()
+
+
+def _labels(landmark):
+    text = _landmark(landmark) or str(landmark)
+    return {text, str(landmark), *SYNONYMS.get(text, ())}
+
+
+def _room_anchor_labels(landmark):
+    text = _landmark(landmark) or str(landmark)
+    for room, anchors in ROOM_ANCHORS.items():
+        if room in text:
+            return anchors
+    return ()
+
+
+def _strong(instance):
+    hits = max(int(instance.hits), 1)
+    return hits >= FINAL_HITS and float(instance.score_sum) / hits >= FINAL_SCORE
 
 
 def _near_look(looks, xz, radius):
