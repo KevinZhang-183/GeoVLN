@@ -6,6 +6,7 @@ import heapq
 import math
 
 import numpy as np
+from scipy import ndimage
 
 from geonav._bootstrap import install
 
@@ -16,6 +17,10 @@ from portal_map import _agent_axes, _dilate  # noqa: E402
 # One grid cell at 0.05 m. 0.15 m of 8-connected dilation, then 0.2 m coarsening,
 # was closing doorways on the planner map.
 INFLATE_M = 0.05
+# Unknown space counted beyond a frontier, and the least of it worth walking to.
+# The shadow behind a table is bounded by the table and seen floor, and stays under the floor area.
+FRONTIER_GAIN_M = 3.0
+FRONTIER_MIN_AREA_M2 = 1.5
 
 
 def bearing_deg(pose, xz):
@@ -66,19 +71,31 @@ class Frontier:
     kept so a later frame can recognize the same opening after the edge moves.
     """
 
-    def __init__(self, xz, trace):
+    def __init__(self, xz, trace, length=0.0, area=0.0):
         self.xz = np.asarray(xz, dtype=np.float64)
         self.trace = np.atleast_2d(np.asarray(trace, dtype=np.float64))
+        self.length = float(length)
+        self.area = float(area)
 
 
-def frontiers(grid, agent_xz, min_m=1.0, close_m=0.2, inflate_m=INFLATE_M):
+def frontiers(
+    grid,
+    agent_xz,
+    min_m=1.0,
+    close_m=0.2,
+    inflate_m=INFLATE_M,
+    gain_m=FRONTIER_GAIN_M,
+    min_area_m2=FRONTIER_MIN_AREA_M2,
+):
     """One stand point per segment of the explored-area boundary.
 
     The explored mask is closed through unknown cells for ``close_m``, without
     crossing obstacles, so a furniture crack or a depth hole does not become an
-    opening. Each remaining segment shorter than ``min_m`` is dropped. The stand
-    point is the segment midpoint, snapped back onto explored ground. ``agent_xz``
-    is unused; selection among these points belongs to the policy.
+    opening. Each remaining segment shorter than ``min_m`` is dropped. ``area``
+    is the unknown region connected to the segment within ``gain_m`` of its
+    midpoint; a segment with less than ``min_area_m2`` behind it is dropped. The
+    stand point is the segment midpoint, snapped back onto explored ground.
+    ``agent_xz`` is unused; selection among these points belongs to the policy.
     """
     del agent_xz
     if grid is None or min_m < 0.0:
@@ -99,19 +116,47 @@ def frontiers(grid, agent_xz, min_m=1.0, close_m=0.2, inflate_m=INFLATE_M):
     inflate_cells = int(math.ceil(inflate_m / max(grid.res, 1e-6)))
     blocked = _dilate(occupied, inflate_cells) if inflate_cells else occupied
     stand = explored & ~occupied & ~blocked
+    unknown = ~explored & ~occupied
     snap_m = close_m + inflate_m + 2.0 * grid.res
     found = []
     for cells in _components(edge):
-        if _opening_length(grid, cells) < min_m:
+        length = _opening_length(grid, cells)
+        if length < min_m:
             continue
         trace = _cells_xz(grid, cells)
         center = trace.mean(axis=0)
-        midpoint = trace[int(np.argmin(np.hypot(trace[:, 0] - center[0], trace[:, 1] - center[1])))]
-        point = _snap_free(grid, stand, midpoint, snap_m)
+        index = int(np.argmin(np.hypot(trace[:, 0] - center[0], trace[:, 1] - center[1])))
+        area = _unknown_area(grid, unknown, cells, cells[index], gain_m)
+        if area < min_area_m2:
+            continue
+        point = _snap_free(grid, stand, trace[index], snap_m)
         if point is None:
             continue
-        found.append(Frontier(point, trace))
+        found.append(Frontier(point, trace, length, area))
     return found
+
+
+def _unknown_area(grid, unknown, cells, middle, radius_m):
+    """Square meters of unknown cells joined to ``cells`` within ``radius_m`` of ``middle``."""
+    reach = int(math.ceil(radius_m / max(grid.res, 1e-6)))
+    row0, col0 = int(middle[0]), int(middle[1])
+    rows = slice(max(0, row0 - reach), min(unknown.shape[0], row0 + reach + 1))
+    cols = slice(max(0, col0 - reach), min(unknown.shape[1], col0 + reach + 1))
+    window = unknown[rows, cols]
+    if not window.any():
+        return 0.0
+    labels, _ = ndimage.label(window, structure=np.ones((3, 3), dtype=bool))
+    seeds = set()
+    for row, col in cells:
+        r, c = row - rows.start, col - cols.start
+        if 0 <= r < labels.shape[0] and 0 <= c < labels.shape[1] and labels[r, c]:
+            seeds.add(int(labels[r, c]))
+    if not seeds:
+        return 0.0
+    rr, cc = np.ogrid[rows.start:rows.stop, cols.start:cols.stop]
+    disk = (rr - row0) ** 2 + (cc - col0) ** 2 <= reach * reach
+    joined = np.isin(labels, list(seeds)) & disk
+    return float(joined.sum()) * grid.res * grid.res
 
 
 def _cells_xz(grid, cells):

@@ -19,11 +19,13 @@ DOOR_WORDS = {"door", "doors", "doorway", "doorways", "arch", "archway"}
 
 
 class Marker:
-    def __init__(self, index, xz, portal_id=None, trace=None):
+    def __init__(self, index, xz, portal_id=None, trace=None, length=0.0, area=0.0):
         self.id = int(index)
         self.xz = np.asarray(xz, dtype=np.float64)
         self.portal_id = portal_id
         self.trace = None if trace is None else np.atleast_2d(np.asarray(trace, dtype=np.float64))
+        self.length = float(length)
+        self.area = float(area)
 
 
 class World:
@@ -36,6 +38,7 @@ class World:
         self.frontiers = []
         self.frontiers_ready = False
         self.frontier_vis = False
+        self.frontier_log = []
         self.nodes = []
         self.new_traversals = []
         self.sam3_calls = 0
@@ -153,11 +156,24 @@ class World:
         """
         agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
         self.frontiers = [
-            Marker(self._next_frontier_id(), item.xz, trace=item.trace)
+            Marker(self._next_frontier_id(), item.xz, trace=item.trace, length=item.length, area=item.area)
             for item in find_frontiers(self.grid, agent)
         ]
         self.frontiers_ready = True
         self.frontier_vis = True
+        self.frontier_log.append({
+            "frame": int(self.portals.step),
+            "agent": [round(float(agent[0]), 3), round(float(agent[1]), 3)],
+            "frontiers": [
+                {
+                    "id": item.id,
+                    "xz": [round(float(item.xz[0]), 3), round(float(item.xz[1]), 3)],
+                    "length_m": round(item.length, 2),
+                    "area_m2": round(item.area, 2),
+                }
+                for item in self.frontiers
+            ],
+        })
 
     def _next_frontier_id(self):
         value = self._frontier_seq

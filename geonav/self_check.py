@@ -81,6 +81,19 @@ def check_frontiers():
     assert found, "the far edge of the explored area is a frontier"
     assert all(item.xz[0] > 0.5 for item in found), [item.xz.tolist() for item in found]
 
+    # The shadow behind a long table is enclosed by the table and seen floor. The open side is not.
+    room = OccupancyGrid(np.zeros(2), config)
+    seen = xx[None, :] <= 2.5
+    table = (np.abs(xx[None, :]) <= 1.5) & (zz[:, None] >= 0.5) & (zz[:, None] < 0.7)
+    shadow = (np.abs(xx[None, :]) <= 1.5) & (zz[:, None] >= 0.7) & (zz[:, None] <= 1.1)
+    room.explored[:] = seen & ~table & ~shadow
+    room.logodds[room.explored] = config.free_logodds - 0.5
+    room.logodds[table] = config.occupied_logodds + 2.0
+    kept = frontiers(room, np.zeros(2))
+    assert kept, "the open side of the room is still a frontier"
+    assert all(item.xz[0] > 2.0 for item in kept), [item.xz.tolist() for item in kept]
+    assert all(item.area >= 1.5 for item in kept), [item.area for item in kept]
+
     short = OccupancyGrid(np.zeros(2), config)
     patch = (np.abs(xx[None, :]) <= 0.15) & (np.abs(zz[:, None]) <= 0.15)
     short.explored[:] = patch
@@ -396,6 +409,21 @@ def check_stop_rules():
     assert policy.decide(world, origin, 0).kind == "look"
     late = policy.decide(world, pose_at(0.0, 4.0, (0.0, 1.0)), 80)
     assert late.kind == "stop" and late.reason == "fallback", late.reason
+
+
+def check_frontier_choice():
+    """A near frontier with little unknown behind it loses to a farther one that opens up more."""
+    from geonav.world import Marker
+
+    world = _FakeWorld(make_grid())
+    world.frontiers = [
+        Marker(1, [0.0, 1.0], area=1.6),
+        Marker(2, [0.0, 4.0], area=12.0),
+    ]
+    policy = Policy("explore", {}, None, allow_look=False)
+    decision = policy.decide(world, pose_at(0.0, 0.0, (1.0, 0.0)), 0)
+    assert decision.kind == "waypoint" and decision.waypoint.name == "F2", decision.reason
+    assert policy.score_log and policy.score_log[-1]["chosen"] == "F2"
 
 
 def check_goal_stop():
@@ -874,6 +902,7 @@ def main():
     check_stuck()
     check_landmark_policy()
     check_stop_rules()
+    check_frontier_choice()
     check_goal_stop()
     check_look_budget()
     check_explored_door()

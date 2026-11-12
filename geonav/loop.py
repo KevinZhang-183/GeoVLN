@@ -247,6 +247,8 @@ def run_one(env, episode, row, args, client):
             for track in world.portals.tracks
         ],
         "instances": [item.to_dict(world.semantic.config.confirm_hits) for item in world.semantic.instances],
+        "frontier_log": world.frontier_log,
+        "waypoint_scores": policy.score_log,
     }
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "episode.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

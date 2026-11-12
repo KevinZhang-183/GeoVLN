@@ -28,6 +28,8 @@ FINAL_SCORE = 0.6
 # R2R counts a stop within 3 m of the goal, and episodes do not start that close to it.
 MIN_STOP_TRAVEL_M = 3.0
 FALLBACK_STEPS = 80
+# Keeps a frontier at the agent's feet from scoring without bound.
+FRONTIER_D0 = 1.0
 ROOM_DEPTH_M = 1.5
 ROOM_RADIUS_M = 4.0
 ROOM_ANCHORS = {
@@ -91,6 +93,7 @@ class Policy:
         self.entered = None
         self.fallback = False
         self.room_rejected = False
+        self.score_log = []
 
     def prompts(self):
         """Phrases for SAM3. Goal follows the dataset point and does not build landmarks."""
@@ -428,18 +431,37 @@ class Policy:
         return ranked[0][1]
 
     def _best_frontier(self, world, pose):
+        """Most unknown area per meter of path. Heading only breaks near ties."""
         agent = np.asarray(pose, dtype=np.float64)[[0, 2], 3]
-        best, best_score = None, 1e9
+        forward = self.prior if self.prior is not None else _agent_axes(pose)[0]
+        ranked = []
         for frontier in world.frontiers:
             if self._banned(frontier.xz):
                 continue
-            if world.grid is not None and plan(world.grid, agent, frontier.xz, snap_m=0.8) is None:
-                continue
-            score = self._score(frontier.xz, pose, False, "")
-            if score < best_score:
-                best, best_score = frontier, score
-        if best is None:
+            route = None
+            if world.grid is not None:
+                route = plan(world.grid, agent, frontier.xz, snap_m=0.8)
+                if route is None:
+                    continue
+            length = _route_length(agent, route, frontier.xz)
+            area = float(getattr(frontier, "area", 0.0))
+            utility = area / (length + FRONTIER_D0)
+            delta = np.asarray(frontier.xz, dtype=np.float64) - agent
+            dist = float(np.linalg.norm(delta))
+            align = 0.0 if dist < 1e-6 else float(np.dot(delta / dist, forward))
+            ranked.append((round(utility, 2), align, frontier, length, area, utility))
+        if not ranked:
             return None
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        best = ranked[0][2]
+        self.score_log.append({
+            "step": self.step,
+            "chosen": f"F{best.id}",
+            "frontiers": [
+                {"id": item[2].id, "area_m2": round(item[4], 2), "path_m": round(item[3], 2), "utility": round(item[5], 3)}
+                for item in ranked
+            ],
+        })
         return point_waypoint(f"F{best.id}", best.xz, radius=0.6, snap_m=0.8)
 
     def _score(self, xz, pose, confirmed, side):
@@ -655,6 +677,13 @@ def room_point(grid, door_center, inward, radius=ROOM_RADIUS_M, depth=ROOM_DEPTH
         target = center + normal * depth
     nearest = int(np.argmin(np.hypot(inside[:, 0] - target[0], inside[:, 1] - target[1])))
     return inside[nearest].copy()
+
+
+def _route_length(agent, route, goal):
+    if not route:
+        return float(np.hypot(*(np.asarray(goal, dtype=np.float64) - agent)))
+    points = np.vstack([agent, np.asarray(route, dtype=np.float64)])
+    return float(np.sum(np.hypot(*np.diff(points, axis=0).T)))
 
 
 def _labels(landmark):
