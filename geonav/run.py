@@ -15,7 +15,8 @@ Then, in the streamvln env (Python 3.9, Habitat 0.2.4), from the GeoVLN director
     python -m geonav.run --mode landmark
 
 Episode files go to --output (default /root/data1/StreamVLN/results/geonav_r2r_100).
-Progress is appended to <output>/run.log, so closing the laptop does not stall the run.
+Progress is printed on the terminal and appended to <output>/run.log.
+A full terminal drops that copy instead of stalling the run.
 """
 
 from __future__ import annotations

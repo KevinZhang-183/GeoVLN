@@ -103,8 +103,8 @@ def serve(processor, host, port, min_score, limit, log_path):
                 self.close_connection = True
 
     server = ThreadingHTTPServer((host, port), Handler)
-    print(f"SAM3 listening on http://{host}:{port}", flush=True)
     redirect_stdio(log_path)
+    print(f"SAM3 listening on http://{host}:{port}", flush=True)
     server.serve_forever()
 
 
